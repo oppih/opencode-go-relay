@@ -144,6 +144,10 @@ wire_api = "chat"
 
 See [`examples/opencode-go-relay.service`](examples/opencode-go-relay.service) for a ready-to-adapt unit file. Use `EnvironmentFile=` to keep keys out of the unit itself.
 
+For an Alibaba Cloud (mainland ECS) walkthrough — user-level Python via `uv`,
+nginx HTTPS on a custom port with a path prefix, per-request key mode, security
+group and ICP-filing notes — see [`docs/aliyun-deploy.md`](docs/aliyun-deploy.md).
+
 ## Security notes
 
 - `OPENCODE_GO_API_KEY` is your paid subscription key — keep it **on the server only**. Clients talk to the relay, never to the upstream.
