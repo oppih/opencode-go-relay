@@ -1,0 +1,10 @@
+{
+  // Claude Code client config — merge into ~/.claude/settings.json
+  // Point Claude Code at the relay; the relay translates Messages -> chat/completions.
+  // 中文:把 Claude Code 指向 relay,relay 负责把 Messages 协议翻译成上游 chat/completions。
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://your-server:8787",
+    "ANTHROPIC_AUTH_TOKEN": "replace-with-RELAY_TOKEN",
+    "ANTHROPIC_MODEL": "deepseek-v4-flash"
+  }
+}

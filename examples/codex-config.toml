@@ -1,0 +1,19 @@
+# Codex client config — merge into ~/.codex/config.toml
+#
+# Option A: point straight at OpenCode Go upstream (chat wire, no relay).
+# 中文:直接指上游,不需要 relay。
+# [model_providers.opencode]
+# name = "OpenCode Go"
+# base_url = "https://opencode.ai/zen/go/v1"
+# env_key = "OPENCODE_GO_API_KEY"
+# wire_api = "chat"
+
+# Option B: route through the relay for unified auth (chat wire).
+# 中文:走 relay,统一鉴权。
+[model_providers.opencode-relay]
+name = "OpenCode Go (relay)"
+base_url = "http://your-server:8787/v1"
+env_key = "RELAY_TOKEN"
+wire_api = "chat"
+
+# Usage: export RELAY_TOKEN=... && codex --provider opencode-relay --model deepseek-v4-flash

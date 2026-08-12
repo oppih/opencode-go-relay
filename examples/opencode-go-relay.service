@@ -1,0 +1,25 @@
+# systemd unit for the OpenCode Go relay.
+# Adapt User/Group/ExecStart paths, then:
+#   sudo cp opencode-go-relay.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now opencode-go-relay
+
+[Unit]
+Description=OpenCode Go protocol relay (Anthropic/Responses -> chat/completions)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=relay
+Group=relay
+ExecStart=/usr/bin/python3 /opt/opencode-go-relay/relay.py
+# Keys live in a root-only file, not in the unit itself
+EnvironmentFile=/etc/opencode-go-relay.env
+Restart=on-failure
+RestartSec=3
+# 64MB request bodies need this on some systems
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
