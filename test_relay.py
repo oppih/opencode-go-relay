@@ -25,6 +25,7 @@ class MockUpstream(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     last_chat_request = None
     chat_requests = []
+    last_auth = None
 
     def log_message(self, *args):
         pass
@@ -42,6 +43,7 @@ class MockUpstream(BaseHTTPRequestHandler):
         payload = json.loads(raw.decode("utf-8"))
         MockUpstream.last_chat_request = payload
         MockUpstream.chat_requests.append(payload)
+        MockUpstream.last_auth = self.headers.get("Authorization", "")
         user_text = "\n".join(
             str(m.get("content", ""))
             for m in payload.get("messages") or []
@@ -388,6 +390,36 @@ def test_models(base):
     print("PASS models")
 
 
+def test_per_request_key(base):
+    # 不带 key -> 401
+    req = urllib.request.Request(base + "/v1/messages",
+                                 data=json.dumps(ANTHROPIC_REQUEST).encode("utf-8"),
+                                 method="POST")
+    req.add_header("Content-Type", "application/json")
+    try:
+        urllib.request.urlopen(req, timeout=10)
+        assert False, "missing key should be rejected"
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 401
+
+    # Authorization: Bearer <key> -> 原样转发上游
+    status, text, _ = post(base + "/v1/messages", ANTHROPIC_REQUEST,
+                           token="user-key-bearer")
+    assert status == 200, (status, text)
+    assert MockUpstream.last_auth == "Bearer user-key-bearer"
+
+    # x-api-key: <key> -> 同样转发为 Bearer
+    req = urllib.request.Request(base + "/v1/messages",
+                                 data=json.dumps(ANTHROPIC_REQUEST).encode("utf-8"),
+                                 method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("x-api-key", "user-key-xapi")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        assert resp.status == 200
+    assert MockUpstream.last_auth == "Bearer user-key-xapi"
+    print("PASS per-request key passthrough")
+
+
 def test_anthropic_stream_midstream_error(base):
     req = dict(ANTHROPIC_REQUEST)
     req["stream"] = True
@@ -569,6 +601,24 @@ def main():
         stdout=subprocess.DEVNULL,
         stderr=open(err_log.name, "wb"),
     )
+
+    # 按请求取 key 模式: 不设置 OPENCODE_GO_API_KEY / RELAY_TOKEN
+    env2 = dict(env)
+    env2.pop("OPENCODE_GO_API_KEY", None)
+    env2["RELAY_TOKEN"] = ""
+    s2 = socket.socket()
+    s2.bind(("127.0.0.1", 0))
+    relay_port2 = s2.getsockname()[1]
+    s2.close()
+    env2["PORT"] = str(relay_port2)
+    err_log2 = tempfile.NamedTemporaryFile(delete=False, suffix=".log")
+    err_log2.close()
+    proc2 = subprocess.Popen(
+        [sys.executable, RELAY_PY],
+        env=env2,
+        stdout=subprocess.DEVNULL,
+        stderr=open(err_log2.name, "wb"),
+    )
     try:
         base = "http://127.0.0.1:%d" % relay_port
         if not wait_ready(relay_port):
@@ -591,10 +641,19 @@ def main():
         test_stream_options_retry(base)
         test_bad_content_length(base, relay_port)
         test_chunked_rejected(base, relay_port)
+
+        base2 = "http://127.0.0.1:%d" % relay_port2
+        if not wait_ready(relay_port2):
+            with open(err_log2.name, "rb") as f:
+                sys.stderr.write("RELAY2 STDERR:\n" + f.read().decode("utf-8", "replace") + "\n")
+            assert False, "per-request relay did not start"
+        test_per_request_key(base2)
         print("\nAll tests passed.")
     finally:
         proc.terminate()
         proc.wait(timeout=5)
+        proc2.terminate()
+        proc2.wait(timeout=5)
         mock.shutdown()
         mock.server_close()
 

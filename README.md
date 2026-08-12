@@ -44,8 +44,8 @@ python3 test_relay.py
 
 | Variable | Default | Description |
 |---|---|---|
-| `OPENCODE_GO_API_KEY` | *(required)* | Your OpenCode Go API key. Only ever set on the server. |
-| `RELAY_TOKEN` | *(empty)* | Client auth token. **Set it before exposing publicly** — without it anyone can use your relay. |
+| `OPENCODE_GO_API_KEY` | *(empty)* | Optional. If set, all requests share this single key (server-key mode). If empty, every request must carry its own key (`Authorization: Bearer <key>` or `x-api-key: <key>`), which is forwarded upstream as-is. |
+| `RELAY_TOKEN` | *(empty)* | Optional client auth token for your own access control. **Set it (or restrict by IP) before exposing publicly** — without it anyone can use your relay. In per-request key mode, leave it empty so the client's own key is the credential. |
 | `DEFAULT_MODEL` | `deepseek-v4-flash` | Model name forwarded upstream / advertised in `/v1/models`. |
 | `UPSTREAM_BASE` | `https://opencode.ai/zen/go/v1` | Upstream OpenAI-compatible base URL. |
 | `HOST` / `PORT` | `0.0.0.0` / `8787` | Listen address. |
@@ -64,7 +64,27 @@ python3 test_relay.py
 | `GET /v1/models` | OpenAI | model list |
 | `GET /healthz` | — | health check (no auth) |
 
-Auth: send `Authorization: Bearer <RELAY_TOKEN>` or `x-api-key: <RELAY_TOKEN>` on every request except `/healthz`.
+Auth: every request except `/healthz` must carry a key. In per-request key mode that key is the client's own OpenCode Go key (sent as `Authorization: Bearer <key>` or `x-api-key: <key>`) and is forwarded upstream. If `RELAY_TOKEN` is set, it acts as an additional gate: send it in one of the two headers and the upstream key in the other.
+
+### Per-request API key mode (recommended for Claude Code)
+
+Leave `OPENCODE_GO_API_KEY` unset. Claude Code already authenticates with
+`ANTHROPIC_AUTH_TOKEN`, so you only need to change the base URL — the key you
+already have is your OpenCode Go key, and the relay forwards it untouched:
+
+```bash
+export ANTHROPIC_BASE_URL="https://your-server:8558/opencode-go/anthropic"
+export ANTHROPIC_AUTH_TOKEN="<your own OpenCode Go key>"
+export ANTHROPIC_MODEL="deepseek-v4-flash"
+claude
+```
+
+> 中文:不设置 `OPENCODE_GO_API_KEY` 时, relay 从每个请求里取 key 并原样转发上游,
+> 服务器不保存任何 key。Claude Code 的 `ANTHROPIC_AUTH_TOKEN` 就是这个 key,
+> 所以只需要把 `ANTHROPIC_BASE_URL` 指向 relay, 其余全部照旧。
+
+Same for Codex: keep your OpenCode Go key as `OPENCODE_GO_API_KEY` in your
+provider config and point `base_url` at the relay.
 
 ## Client setup
 

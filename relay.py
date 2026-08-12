@@ -15,7 +15,7 @@ OpenCode Go relay
   GET  /healthz                          -> 健康检查
 
 环境变量:
-  OPENCODE_GO_API_KEY   必填, 你的 OpenCode Go API key (只放在服务器上)
+  OPENCODE_GO_API_KEY   可选, 设置后所有请求共用该 key; 留空则每个请求必须自带 key
   RELAY_TOKEN           可选, 强烈建议公网部署时设置, 客户端用它鉴权
   DEFAULT_MODEL         默认 deepseek-v4-flash
   UPSTREAM_BASE         默认 https://opencode.ai/zen/go/v1
@@ -69,15 +69,18 @@ def json_bytes(obj):
 # 上游请求
 # ---------------------------------------------------------------------------
 
-def upstream_request(path, payload, headers=None):
-    """POST 到 OpenCode Go 上游, 返回 http.client.HTTPResponse (可流式读)。"""
+def upstream_request(path, payload, headers=None, api_key=None):
+    """POST 到 OpenCode Go 上游, 返回 http.client.HTTPResponse (可流式读)。
+
+    api_key 优先取请求级 key, 否则回退服务器级 GO_KEY (OPENCODE_GO_API_KEY)。
+    """
     req = urllib.request.Request(
         UPSTREAM_BASE + path,
         data=json_bytes(payload),
         method="POST",
     )
     req.add_header("Content-Type", "application/json")
-    req.add_header("Authorization", "Bearer " + GO_KEY)
+    req.add_header("Authorization", "Bearer " + (api_key or GO_KEY))
     req.add_header("User-Agent", UPSTREAM_UA)
     for k, v in (headers or {}).items():
         req.add_header(k, v)
@@ -819,6 +822,22 @@ class RelayHandler(BaseHTTPRequestHandler):
             return True
         return False
 
+    def _get_api_key(self):
+        """从请求头提取客户端携带的上游 key (Claude Code 的 ANTHROPIC_AUTH_TOKEN 即走这里)。"""
+        auth = self.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            key = auth[7:].strip()
+            if key:
+                return key
+        return self.headers.get("x-api-key", "").strip()
+
+    def _upstream_api_key(self):
+        """本次请求使用的上游 key。设置过 GO_KEY 就统一用它 (服务器级模式);
+        否则透传请求头里的 key (按请求取 key 模式)。"""
+        if GO_KEY:
+            return GO_KEY
+        return self._get_api_key()
+
     def _send_json(self, status, obj):
         data = json_bytes(obj)
         self.send_response(status)
@@ -916,12 +935,18 @@ class RelayHandler(BaseHTTPRequestHandler):
         body = self._read_body()
         if body is None:
             return
+        api_key = self._upstream_api_key()
+        if not api_key:
+            self._send_json(401, {
+                "error": {"message": "missing API key (send Authorization: Bearer <key> or x-api-key: <key>)"},
+            })
+            return
         if path == "/v1/messages":
-            self._handle_anthropic(body)
+            self._handle_anthropic(body, api_key)
         elif path == "/v1/responses":
-            self._handle_responses(body)
+            self._handle_responses(body, api_key)
         elif path == "/v1/chat/completions":
-            self._handle_chat_passthrough(body)
+            self._handle_chat_passthrough(body, api_key)
         else:
             self._send_json(404, {"error": {"message": "not found"}})
 
@@ -947,17 +972,17 @@ class RelayHandler(BaseHTTPRequestHandler):
 
     # -- Anthropic 端点 ----------------------------------------------------
 
-    def _handle_anthropic(self, body):
+    def _handle_anthropic(self, body, api_key):
         requested_model = body.get("model") or DEFAULT_MODEL
         chat = anthropic_to_openai(body)
         try:
-            upstream = upstream_request("/chat/completions", chat)
+            upstream = upstream_request("/chat/completions", chat, api_key=api_key)
         except urllib.error.HTTPError as exc:
             if exc.code in (400, 422) and USE_STREAM_OPTIONS and chat.get("stream"):
                 # 某些上游不认 stream_options, 去掉重试一次
                 chat.pop("stream_options", None)
                 try:
-                    upstream = upstream_request("/chat/completions", chat)
+                    upstream = upstream_request("/chat/completions", chat, api_key=api_key)
                 except urllib.error.HTTPError as exc2:
                     self._upstream_error(exc2, anthropic_style=True)
                     return
@@ -986,16 +1011,16 @@ class RelayHandler(BaseHTTPRequestHandler):
 
     # -- Responses 端点 ----------------------------------------------------
 
-    def _handle_responses(self, body):
+    def _handle_responses(self, body, api_key):
         requested_model = body.get("model") or DEFAULT_MODEL
         chat = responses_to_chat(body)
         try:
-            upstream = upstream_request("/chat/completions", chat)
+            upstream = upstream_request("/chat/completions", chat, api_key=api_key)
         except urllib.error.HTTPError as exc:
             if exc.code in (400, 422) and USE_STREAM_OPTIONS and chat.get("stream"):
                 chat.pop("stream_options", None)
                 try:
-                    upstream = upstream_request("/chat/completions", chat)
+                    upstream = upstream_request("/chat/completions", chat, api_key=api_key)
                 except urllib.error.HTTPError as exc2:
                     self._upstream_error(exc2, anthropic_style=False)
                     return
@@ -1021,11 +1046,11 @@ class RelayHandler(BaseHTTPRequestHandler):
 
     # -- OpenAI chat 直通 ---------------------------------------------------
 
-    def _handle_chat_passthrough(self, body):
+    def _handle_chat_passthrough(self, body, api_key):
         body = dict(body)
         body["model"] = DEFAULT_MODEL
         try:
-            upstream = upstream_request("/chat/completions", body)
+            upstream = upstream_request("/chat/completions", body, api_key=api_key)
         except urllib.error.HTTPError as exc:
             self._upstream_error(exc, anthropic_style=False)
             return
@@ -1080,11 +1105,13 @@ class LimitedThreadingHTTPServer(ThreadingHTTPServer):
 def main():
     if not GO_KEY:
         sys.stderr.write(
-            "WARNING: OPENCODE_GO_API_KEY is empty; upstream requests will fail.\n")
+            "WARNING: OPENCODE_GO_API_KEY is empty; each request must carry its own "
+            "API key (Authorization: Bearer <key> or x-api-key: <key>).\n")
     if not RELAY_TOKEN:
         sys.stderr.write(
             "WARNING: RELAY_TOKEN is empty; anyone can use this relay. "
-            "Set RELAY_TOKEN before exposing it publicly.\n")
+            "Set RELAY_TOKEN or restrict access (e.g. IP allowlist) before "
+            "exposing it publicly.\n")
     server = LimitedThreadingHTTPServer((HOST, PORT), RelayHandler)
     sys.stderr.write(
         "OpenCode Go relay listening on http://%s:%d -> %s (model: %s)\n"
