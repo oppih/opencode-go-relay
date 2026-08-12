@@ -20,7 +20,7 @@ OpenCode Go exposes an OpenAI-compatible endpoint (`https://opencode.ai/zen/go/v
 - **`POST /v1/responses`** (Responses) ⇄ upstream `chat/completions`
   - `instructions` → system, `function_call` / `function_call_output` items, `max_output_tokens` → `max_tokens`
   - SSE translation: `response.created`, `output_text.delta`, `function_call_arguments.delta`, `response.completed`
-- **`POST /v1/chat/completions`** — pass-through (rewrites model + auth only)
+- **`POST /v1/chat/completions`** — pass-through (auth only; the client's model is forwarded, defaulting to `DEFAULT_MODEL` when omitted)
 - **`GET /v1/models`**, **`GET /healthz`**
 - Token auth (`RELAY_TOKEN`), 64 MB body cap, `stream_options` auto-retry fallback for picky upstreams
 - Python 3.9+, standard library only
@@ -46,7 +46,7 @@ python3 test_relay.py
 |---|---|---|
 | `OPENCODE_GO_API_KEY` | *(empty)* | Optional. If set, all requests share this single key (server-key mode). If empty, every request must carry its own key (`Authorization: Bearer <key>` or `x-api-key: <key>`), which is forwarded upstream as-is. |
 | `RELAY_TOKEN` | *(empty)* | Optional client auth token for your own access control. **Set it (or restrict by IP) before exposing publicly** — without it anyone can use your relay. In per-request key mode, leave it empty so the client's own key is the credential. |
-| `DEFAULT_MODEL` | `deepseek-v4-flash` | Model name forwarded upstream / advertised in `/v1/models`. |
+| `DEFAULT_MODEL` | `deepseek-v4-flash` | Fallback model used when the client omits one; also advertised in `/v1/models`. Clients can request any OpenCode Go model (e.g. `glm-5.2`) and it is forwarded as-is. |
 | `UPSTREAM_BASE` | `https://opencode.ai/zen/go/v1` | Upstream OpenAI-compatible base URL. |
 | `HOST` / `PORT` | `0.0.0.0` / `8787` | Listen address. |
 | `STREAM_OPTIONS` | `1` | Send `stream_options.include_usage` upstream; set `0` if the upstream rejects it. |

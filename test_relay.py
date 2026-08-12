@@ -309,7 +309,7 @@ def test_anthropic_nonstream(base):
     assert msg["usage"]["input_tokens"] == 11
 
     up = MockUpstream.last_chat_request
-    assert up["model"] == "deepseek-v4-flash"
+    assert up["model"] == "claude-sonnet-4-5"  # 客户端模型透传
     assert up["stream"] is False
     roles = [m["role"] for m in up["messages"]]
     assert roles == ["system", "user", "assistant", "tool"], roles
@@ -359,7 +359,7 @@ def test_responses_nonstream(base):
     assert resp["usage"]["input_tokens"] == 11
 
     up = MockUpstream.last_chat_request
-    assert up["model"] == "deepseek-v4-flash"
+    assert up["model"] == "gpt-5.2-codex"  # 客户端模型透传
     roles = [m["role"] for m in up["messages"]]
     assert roles == ["system", "user", "assistant", "tool"], roles
     assert up["messages"][2]["tool_calls"][0]["id"] == "call_99"
@@ -390,15 +390,33 @@ def test_responses_stream(base):
 
 def test_chat_passthrough(base):
     status, text, _ = post(base + "/v1/chat/completions", {
-        "model": "whatever",
+        "model": "glm-5.2",
         "messages": [{"role": "user", "content": "hi"}],
         "stream": False,
     })
     assert status == 200, (status, text)
     data = json.loads(text)
     assert data["choices"][0]["message"]["content"] == "Hello"
-    assert MockUpstream.last_chat_request["model"] == "deepseek-v4-flash"
+    assert MockUpstream.last_chat_request["model"] == "glm-5.2"
     print("PASS chat passthrough")
+
+
+def test_model_passthrough_and_default(base):
+    # 请求带模型 -> 透传; 不带 -> 回退 DEFAULT_MODEL
+    req = dict(ANTHROPIC_REQUEST)
+    req["stream"] = False
+    req["model"] = "glm-5.2"
+    status, text, _ = post(base + "/v1/messages", req)
+    assert status == 200, (status, text)
+    assert MockUpstream.last_chat_request["model"] == "glm-5.2"
+
+    req = dict(ANTHROPIC_REQUEST)
+    req["stream"] = False
+    req.pop("model", None)
+    status, text, _ = post(base + "/v1/messages", req)
+    assert status == 200, (status, text)
+    assert MockUpstream.last_chat_request["model"] == "deepseek-v4-flash"
+    print("PASS model passthrough + default fallback")
 
 
 def test_auth(base):
@@ -844,6 +862,7 @@ def main():
         test_responses_nonstream(base)
         test_responses_stream(base)
         test_chat_passthrough(base)
+        test_model_passthrough_and_default(base)
         test_anthropic_stream_midstream_error(base)
         test_responses_stream_indices(base)
         test_anthropic_tool_first_block_order(base)

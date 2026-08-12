@@ -198,7 +198,8 @@ def _map_tool_choice(tc):
 
 def anthropic_to_openai(body):
     """把 Claude Code 的 /v1/messages 请求翻译成 OpenAI chat.completions。"""
-    out = {"model": DEFAULT_MODEL}
+    # 透传客户端指定的模型 (例如 glm-5.2 / deepseek-v4-pro), 未指定才回退默认
+    out = {"model": body.get("model") or DEFAULT_MODEL}
     messages = []
 
     system = body.get("system")
@@ -474,7 +475,7 @@ def anthropic_sse_translator(upstream, requested_model):
 
 def responses_to_chat(body):
     """把 Codex 的 /v1/responses 请求翻译成 OpenAI chat.completions。"""
-    out = {"model": DEFAULT_MODEL}
+    out = {"model": body.get("model") or DEFAULT_MODEL}
     messages = []
 
     instructions = body.get("instructions")
@@ -1115,7 +1116,7 @@ class RelayHandler(BaseHTTPRequestHandler):
 
     def _handle_chat_passthrough(self, body, api_key):
         body = dict(body)
-        body["model"] = DEFAULT_MODEL
+        body["model"] = body.get("model") or DEFAULT_MODEL
         try:
             upstream = upstream_request("/chat/completions", body, api_key=api_key)
         except urllib.error.HTTPError as exc:
