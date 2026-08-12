@@ -312,6 +312,13 @@ def chat_to_anthropic(data, requested_model):
     choice = (data.get("choices") or [{}])[0]
     m = choice.get("message") or {}
     content = []
+    reasoning = m.get("reasoning_content") or m.get("reasoning")
+    if reasoning:
+        content.append({
+            "type": "thinking",
+            "thinking": reasoning,
+            "signature": "",
+        })
     text = m.get("content")
     if text:
         content.append({"type": "text", "text": text})
@@ -352,6 +359,8 @@ def chat_to_anthropic(data, requested_model):
 def anthropic_sse_translator(upstream, requested_model):
     """把上游 chat.completions 的 SSE 增量翻译成 Anthropic 的 SSE 事件。"""
     msg_id = _uuid("msg_")
+    thinking_open = False
+    thinking_block_index = None
     text_open = False
     text_block_index = None
     tools = {}
@@ -388,6 +397,24 @@ def anthropic_sse_translator(upstream, requested_model):
         for choice in chunk.get("choices") or []:
             delta = choice.get("delta") or {}
             fr = choice.get("finish_reason")
+
+            reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+            if reasoning:
+                if not thinking_open:
+                    thinking_open = True
+                    thinking_block_index = next_block_index
+                    next_block_index += 1
+                    yield ev("content_block_start", {
+                        "type": "content_block_start",
+                        "index": thinking_block_index,
+                        "content_block": {
+                            "type": "thinking", "thinking": "", "signature": ""},
+                    })
+                yield ev("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": thinking_block_index,
+                    "delta": {"type": "thinking_delta", "thinking": reasoning},
+                })
 
             text = delta.get("content")
             if text:
@@ -444,6 +471,8 @@ def anthropic_sse_translator(upstream, requested_model):
                 stop_reason = "max_tokens"
 
     stop_indexes = []
+    if thinking_open:
+        stop_indexes.append(thinking_block_index)
     if text_open:
         stop_indexes.append(text_block_index)
     for st in tools.values():
@@ -597,6 +626,14 @@ def chat_to_responses(data, requested_model):
     m = choice.get("message") or {}
     incomplete = choice.get("finish_reason") == "length"
     output = []
+    reasoning = m.get("reasoning_content") or m.get("reasoning")
+    if reasoning:
+        output.append({
+            "id": _uuid("rs_"),
+            "type": "reasoning",
+            "status": "completed",
+            "summary": [{"type": "summary_text", "text": reasoning}],
+        })
     text = m.get("content")
     if text:
         output.append({
@@ -638,6 +675,10 @@ def responses_sse_translator(upstream, requested_model):
     """把上游 chat.completions 的 SSE 增量翻译成 Responses 的 SSE 事件。"""
     resp_id = _uuid("resp_")
     created_at = int(time.time())
+    reasoning_open = False
+    reasoning_index = None
+    reasoning_item_id = None
+    reasoning_buf = []
     msg_item_id = _uuid("msg_")
     text_buf = []
     text_open = False
@@ -687,6 +728,31 @@ def responses_sse_translator(upstream, requested_model):
         for choice in chunk.get("choices") or []:
             delta = choice.get("delta") or {}
             fr = choice.get("finish_reason")
+
+            reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+            if reasoning:
+                if not reasoning_open:
+                    reasoning_open = True
+                    reasoning_item_id = _uuid("rs_")
+                    reasoning_index = next_output_index
+                    next_output_index += 1
+                    yield ev("response.output_item.added", {
+                        "type": "response.output_item.added",
+                        "output_index": reasoning_index,
+                        "item": {
+                            "id": reasoning_item_id,
+                            "type": "reasoning",
+                            "status": "in_progress",
+                            "summary": [],
+                        },
+                    })
+                reasoning_buf.append(reasoning)
+                yield ev("response.reasoning_summary_text.delta", {
+                    "type": "response.reasoning_summary_text.delta",
+                    "item_id": reasoning_item_id,
+                    "output_index": reasoning_index,
+                    "summary_text": reasoning,
+                })
 
             text = delta.get("content")
             if text:
@@ -766,6 +832,27 @@ def responses_sse_translator(upstream, requested_model):
                 stop_reason = "max_tokens"
 
     output = []
+    if reasoning_open:
+        full_reasoning = "".join(reasoning_buf)
+        reasoning_item = {
+            "id": reasoning_item_id,
+            "type": "reasoning",
+            "status": "completed",
+            "summary": [{"type": "summary_text", "text": full_reasoning}],
+        }
+        yield ev("response.reasoning_summary_text.done", {
+            "type": "response.reasoning_summary_text.done",
+            "item_id": reasoning_item_id,
+            "output_index": reasoning_index,
+            "summary_text": full_reasoning,
+        })
+        yield ev("response.output_item.done", {
+            "type": "response.output_item.done",
+            "output_index": reasoning_index,
+            "item": reasoning_item,
+        })
+        output.append(reasoning_item)
+
     if text_open:
         full_text = "".join(text_buf)
         msg_item = {

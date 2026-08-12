@@ -59,6 +59,24 @@ class MockUpstream(BaseHTTPRequestHandler):
             return
 
         if not payload.get("stream"):
+            if "TRIGGER_REASONING" in user_text:
+                body = {
+                    "id": "chatcmpl-mock",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "deepseek-v4-flash",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant",
+                                    "content": "the answer",
+                                    "reasoning_content": "let me think carefully"},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 5,
+                              "total_tokens": 8},
+                }
+                self._send(200, "application/json", json.dumps(body).encode("utf-8"))
+                return
             if "TRIGGER_LENGTH" in user_text:
                 body = {
                     "id": "chatcmpl-mock",
@@ -135,7 +153,15 @@ class MockUpstream(BaseHTTPRequestHandler):
             self.wfile.write(b"data: <html>blocked</html>\n\n")
             self.wfile.flush()
             return
-        if "TRIGGER_LENGTH_STREAM" in user_text:
+        if "TRIGGER_REASONING_STREAM" in user_text:
+            chunks = [
+                {"choices": [{"index": 0, "delta": {"reasoning_content": "let me think"},
+                              "finish_reason": None}]},
+                {"choices": [{"index": 0, "delta": {"content": "the answer"},
+                              "finish_reason": None}]},
+                {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+            ]
+        elif "TRIGGER_LENGTH_STREAM" in user_text:
             chunks = [
                 {"choices": [{"index": 0, "delta": {"content": "cut"},
                               "finish_reason": None}]},
@@ -602,6 +628,60 @@ def test_html_sse_guard(base):
     print("PASS html SSE guard")
 
 
+def test_thinking_blocks(base):
+    # 非流式 anthropic: reasoning_content -> thinking 块 (在 text 之前)
+    req = dict(ANTHROPIC_REQUEST)
+    req["stream"] = False
+    req["messages"] = [{"role": "user", "content": "TRIGGER_REASONING"}]
+    status, text, _ = post(base + "/v1/messages", req)
+    assert status == 200, (status, text)
+    msg = json.loads(text)
+    assert msg["content"][0]["type"] == "thinking"
+    assert msg["content"][0]["thinking"] == "let me think carefully"
+    assert msg["content"][1] == {"type": "text", "text": "the answer"}
+
+    # 流式 anthropic: thinking 块先于 text 块, 索引递增, thinking_delta 事件
+    req["stream"] = True
+    req["messages"] = [{"role": "user", "content": "TRIGGER_REASONING_STREAM"}]
+    status, text, _ = post(base + "/v1/messages", req)
+    assert status == 200, (status, text)
+    events = parse_sse_events(text)
+    starts = [d for e, d in events if e == "content_block_start"]
+    assert [d["content_block"]["type"] for d in starts] == ["thinking", "text"], starts
+    assert [d["index"] for d in starts] == [0, 1]
+    tds = [d for e, d in events if e == "content_block_delta"
+           and d["delta"].get("type") == "thinking_delta"]
+    assert tds and tds[0]["delta"]["thinking"] == "let me think"
+    stops = [d["index"] for e, d in events if e == "content_block_stop"]
+    assert stops == [0, 1], stops
+
+    # 非流式 responses: reasoning item 在 output 首位
+    rq = dict(RESPONSES_REQUEST)
+    rq["stream"] = False
+    rq["input"] = [{"role": "user", "content": "TRIGGER_REASONING"}]
+    status, text, _ = post(base + "/v1/responses", rq)
+    assert status == 200, (status, text)
+    resp = json.loads(text)
+    assert resp["output"][0]["type"] == "reasoning"
+    assert resp["output"][0]["summary"][0]["text"] == "let me think carefully"
+    assert resp["output"][1]["type"] == "message"
+
+    # 流式 responses: reasoning output_item index 0, 文本 index 1
+    rq["stream"] = True
+    rq["input"] = [{"role": "user", "content": "TRIGGER_REASONING_STREAM"}]
+    status, text, _ = post(base + "/v1/responses", rq)
+    assert status == 200, (status, text)
+    events = parse_sse_events(text)
+    added = [d for e, d in events if e == "response.output_item.added"]
+    assert [d["output_index"] for d in added] == [0, 1]
+    assert added[0]["item"]["type"] == "reasoning"
+    assert [d for e, d in events if e == "response.reasoning_summary_text.delta"]
+    completed = [d for e, d in events if e == "response.completed"][0]
+    assert completed["response"]["output"][0]["type"] == "reasoning"
+    assert completed["response"]["output"][1]["type"] == "message"
+    print("PASS thinking/reasoning blocks")
+
+
 def test_client_socket_timeout(base, port):
     import socket
     s = socket.create_connection(("127.0.0.1", port), timeout=10)
@@ -875,6 +955,7 @@ def main():
         test_nonjson_upstream(base)
         test_length_finish_reason(base)
         test_html_sse_guard(base)
+        test_thinking_blocks(base)
 
         base2 = "http://127.0.0.1:%d" % relay_port2
         if not wait_ready(relay_port2):
