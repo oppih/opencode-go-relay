@@ -54,7 +54,27 @@ class MockUpstream(BaseHTTPRequestHandler):
             self._send(502, "text/html", b"<html><body>cloudflare blocked</body></html>")
             return
 
+        if "TRIGGER_NONJSON_200" in user_text:
+            self._send(200, "text/html", b"<html>gateway hiccup</html>")
+            return
+
         if not payload.get("stream"):
+            if "TRIGGER_LENGTH" in user_text:
+                body = {
+                    "id": "chatcmpl-mock",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "deepseek-v4-flash",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "cut"},
+                        "finish_reason": "length",
+                    }],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 2,
+                              "total_tokens": 5},
+                }
+                self._send(200, "application/json", json.dumps(body).encode("utf-8"))
+                return
             if "TRIGGER_EMPTY_CONTENT" in user_text:
                 body = {
                     "id": "chatcmpl-mock",
@@ -111,7 +131,19 @@ class MockUpstream(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
 
-        if "TRIGGER_SSE_ERROR" in user_text:
+        if "TRIGGER_HTML_SSE" in user_text:
+            self.wfile.write(b"data: <html>blocked</html>\n\n")
+            self.wfile.flush()
+            return
+        if "TRIGGER_LENGTH_STREAM" in user_text:
+            chunks = [
+                {"choices": [{"index": 0, "delta": {"content": "cut"},
+                              "finish_reason": None}]},
+                {"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}],
+                 "usage": {"prompt_tokens": 3, "completion_tokens": 2,
+                           "total_tokens": 5}},
+            ]
+        elif "TRIGGER_SSE_ERROR" in user_text:
             chunks = [
                 {"id": "chatcmpl-mock", "object": "chat.completion.chunk", "created": 1,
                  "model": "deepseek-v4-flash",
@@ -344,6 +376,7 @@ def test_responses_stream(base):
     events = parse_sse_events(text)
     names = [e for e, _ in events]
     assert "response.created" in names
+    assert "response.in_progress" in names
     assert "response.output_item.added" in names
     assert "response.output_text.delta" in names
     assert "response.function_call_arguments.delta" in names
@@ -418,6 +451,168 @@ def test_per_request_key(base):
         assert resp.status == 200
     assert MockUpstream.last_auth == "Bearer user-key-xapi"
     print("PASS per-request key passthrough")
+
+
+def test_relay_token_not_forwarded(base):
+    # 只带 relay token -> 门禁通过但没有上游 key -> 401
+    req = urllib.request.Request(base + "/v1/messages",
+                                 data=json.dumps(ANTHROPIC_REQUEST).encode("utf-8"),
+                                 method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Authorization", "Bearer relay-gate")
+    try:
+        urllib.request.urlopen(req, timeout=10)
+        assert False, "should be 401"
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 401
+
+    # relay token 在 Bearer, 上游 key 在 x-api-key -> 转发的是 key 不是 token
+    req = urllib.request.Request(base + "/v1/messages",
+                                 data=json.dumps(ANTHROPIC_REQUEST).encode("utf-8"),
+                                 method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Authorization", "Bearer relay-gate")
+    req.add_header("x-api-key", "user-key-xapi")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        assert resp.status == 200
+    assert MockUpstream.last_auth == "Bearer user-key-xapi"
+
+    # 上游 key 在 Bearer, relay token 在 x-api-key -> 同理
+    req = urllib.request.Request(base + "/v1/messages",
+                                 data=json.dumps(ANTHROPIC_REQUEST).encode("utf-8"),
+                                 method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Authorization", "Bearer user-key-bearer2")
+    req.add_header("x-api-key", "relay-gate")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        assert resp.status == 200
+    assert MockUpstream.last_auth == "Bearer user-key-bearer2"
+
+    # 只带上游 key、不带 relay token -> 401
+    req = urllib.request.Request(base + "/v1/messages",
+                                 data=json.dumps(ANTHROPIC_REQUEST).encode("utf-8"),
+                                 method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Authorization", "Bearer user-key-only")
+    try:
+        urllib.request.urlopen(req, timeout=10)
+        assert False, "should be 401"
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 401
+    print("PASS relay token not forwarded upstream")
+
+
+def test_nonjson_upstream(base):
+    req = dict(ANTHROPIC_REQUEST)
+    req["stream"] = False
+    req["messages"] = [{"role": "user", "content": "TRIGGER_NONJSON_200"}]
+    r = urllib.request.Request(base + "/v1/messages",
+                               data=json.dumps(req).encode("utf-8"), method="POST")
+    r.add_header("Content-Type", "application/json")
+    r.add_header("Authorization", "Bearer secret")
+    try:
+        urllib.request.urlopen(r, timeout=30)
+        assert False, "should be 502"
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 502
+        assert "non-JSON" in json.loads(exc.read().decode("utf-8"))["error"]["message"]
+
+    rq = dict(RESPONSES_REQUEST)
+    rq["stream"] = False
+    rq["input"] = [{"role": "user", "content": "TRIGGER_NONJSON_200"}]
+    r = urllib.request.Request(base + "/v1/responses",
+                               data=json.dumps(rq).encode("utf-8"), method="POST")
+    r.add_header("Content-Type", "application/json")
+    r.add_header("Authorization", "Bearer secret")
+    try:
+        urllib.request.urlopen(r, timeout=30)
+        assert False, "should be 502"
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 502
+        assert "non-JSON" in json.loads(exc.read().decode("utf-8"))["error"]["message"]
+    print("PASS upstream non-JSON 200 -> 502")
+
+
+def test_length_finish_reason(base):
+    # 非流式 anthropic: length -> max_tokens
+    req = dict(ANTHROPIC_REQUEST)
+    req["stream"] = False
+    req["messages"] = [{"role": "user", "content": "TRIGGER_LENGTH"}]
+    status, text, _ = post(base + "/v1/messages", req)
+    assert status == 200, (status, text)
+    assert json.loads(text)["stop_reason"] == "max_tokens"
+
+    # 非流式 responses: length -> incomplete
+    rq = dict(RESPONSES_REQUEST)
+    rq["stream"] = False
+    rq["input"] = [{"role": "user", "content": "TRIGGER_LENGTH"}]
+    status, text, _ = post(base + "/v1/responses", rq)
+    assert status == 200, (status, text)
+    resp = json.loads(text)
+    assert resp["status"] == "incomplete"
+    assert resp["incomplete_details"] == {"reason": "max_output_tokens"}
+
+    # 流式 anthropic
+    req["stream"] = True
+    req["messages"] = [{"role": "user", "content": "TRIGGER_LENGTH_STREAM"}]
+    status, text, _ = post(base + "/v1/messages", req)
+    assert status == 200, (status, text)
+    events = parse_sse_events(text)
+    md = [d for e, d in events if e == "message_delta"][0]
+    assert md["delta"]["stop_reason"] == "max_tokens", md
+
+    # 流式 responses
+    rq["stream"] = True
+    rq["input"] = [{"role": "user", "content": "TRIGGER_LENGTH_STREAM"}]
+    status, text, _ = post(base + "/v1/responses", rq)
+    assert status == 200, (status, text)
+    events = parse_sse_events(text)
+    completed = [d for e, d in events if e == "response.completed"][0]
+    assert completed["response"]["status"] == "incomplete"
+    assert completed["response"]["incomplete_details"]["reason"] == "max_output_tokens"
+    print("PASS finish_reason length mapping")
+
+
+def test_html_sse_guard(base):
+    req = dict(ANTHROPIC_REQUEST)
+    req["stream"] = True
+    req["messages"] = [{"role": "user", "content": "TRIGGER_HTML_SSE"}]
+    status, text, _ = post(base + "/v1/messages", req)
+    assert status == 200, (status, text)
+    events = parse_sse_events(text)
+    assert [d for e, d in events if e == "error"], [e for e, _ in events]
+    print("PASS html SSE guard")
+
+
+def test_client_socket_timeout(base, port):
+    import socket
+    s = socket.create_connection(("127.0.0.1", port), timeout=10)
+    # 只发半个请求头, 不发完 -> 服务器应在 CLIENT_TIMEOUT 后断开
+    s.sendall(b"POST /v1/messages HTTP/1.1\r\nHost: x\r\n")
+    time.sleep(3.5)
+    s.settimeout(2)
+    data = s.recv(4096)
+    s.close()
+    assert data == b"", data[:100]
+    print("PASS client socket timeout (slowloris)")
+
+
+def test_sigterm_graceful(proc):
+    proc.terminate()
+    rc = proc.wait(timeout=10)
+    assert rc == 0, rc
+    print("PASS SIGTERM graceful shutdown")
+
+
+def test_bad_env_exits_cleanly():
+    env = dict(os.environ)
+    env["PORT"] = "abc"
+    env["OPENCODE_GO_API_KEY"] = "x"
+    proc = subprocess.run([sys.executable, RELAY_PY], env=env,
+                          capture_output=True, text=True, timeout=10)
+    assert proc.returncode == 1, proc.returncode
+    assert "PORT must be a number" in proc.stderr, proc.stderr
+    print("PASS bad env exits cleanly")
 
 
 def test_anthropic_stream_midstream_error(base):
@@ -585,7 +780,6 @@ def main():
         "DEFAULT_MODEL": "deepseek-v4-flash",
         "UPSTREAM_BASE": "http://127.0.0.1:%d/v1" % mock_port,
         "HOST": "127.0.0.1",
-        "PORT": "0",  # 不支持 0, 下面用固定端口
     })
     import socket
     s = socket.socket()
@@ -606,6 +800,7 @@ def main():
     env2 = dict(env)
     env2.pop("OPENCODE_GO_API_KEY", None)
     env2["RELAY_TOKEN"] = ""
+    env2["CLIENT_TIMEOUT"] = "2"  # 测 slowloris 用短超时
     s2 = socket.socket()
     s2.bind(("127.0.0.1", 0))
     relay_port2 = s2.getsockname()[1]
@@ -618,6 +813,23 @@ def main():
         env=env2,
         stdout=subprocess.DEVNULL,
         stderr=open(err_log2.name, "wb"),
+    )
+
+    # 按请求取 key + RELAY_TOKEN 门禁模式
+    env3 = dict(env2)
+    env3["RELAY_TOKEN"] = "relay-gate"
+    s3 = socket.socket()
+    s3.bind(("127.0.0.1", 0))
+    relay_port3 = s3.getsockname()[1]
+    s3.close()
+    env3["PORT"] = str(relay_port3)
+    err_log3 = tempfile.NamedTemporaryFile(delete=False, suffix=".log")
+    err_log3.close()
+    proc3 = subprocess.Popen(
+        [sys.executable, RELAY_PY],
+        env=env3,
+        stdout=subprocess.DEVNULL,
+        stderr=open(err_log3.name, "wb"),
     )
     try:
         base = "http://127.0.0.1:%d" % relay_port
@@ -641,6 +853,9 @@ def main():
         test_stream_options_retry(base)
         test_bad_content_length(base, relay_port)
         test_chunked_rejected(base, relay_port)
+        test_nonjson_upstream(base)
+        test_length_finish_reason(base)
+        test_html_sse_guard(base)
 
         base2 = "http://127.0.0.1:%d" % relay_port2
         if not wait_ready(relay_port2):
@@ -648,12 +863,26 @@ def main():
                 sys.stderr.write("RELAY2 STDERR:\n" + f.read().decode("utf-8", "replace") + "\n")
             assert False, "per-request relay did not start"
         test_per_request_key(base2)
+        test_client_socket_timeout(base2, relay_port2)
+        test_sigterm_graceful(proc2)
+
+        base3 = "http://127.0.0.1:%d" % relay_port3
+        if not wait_ready(relay_port3):
+            with open(err_log3.name, "rb") as f:
+                sys.stderr.write("RELAY3 STDERR:\n" + f.read().decode("utf-8", "replace") + "\n")
+            assert False, "gated relay did not start"
+        test_relay_token_not_forwarded(base3)
+
+        test_bad_env_exits_cleanly()
         print("\nAll tests passed.")
     finally:
         proc.terminate()
         proc.wait(timeout=5)
-        proc2.terminate()
-        proc2.wait(timeout=5)
+        if proc2.poll() is None:
+            proc2.terminate()
+            proc2.wait(timeout=5)
+        proc3.terminate()
+        proc3.wait(timeout=5)
         mock.shutdown()
         mock.server_close()
 

@@ -53,6 +53,7 @@ python3 test_relay.py
 | `REQUEST_TIMEOUT` | `600` | Upstream request timeout (seconds). |
 | `UPSTREAM_UA` | *(browser UA)* | User-Agent sent upstream; some edges (e.g. Cloudflare) reject urllib's default. |
 | `MAX_CONNECTIONS` | `64` | Max concurrent connections; excess connections wait (backpressure). |
+| `CLIENT_TIMEOUT` | `60` | Per-connection read timeout in seconds; idle connections (slowloris) are dropped. |
 
 ### Endpoints
 

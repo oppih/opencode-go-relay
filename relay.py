@@ -23,6 +23,7 @@ OpenCode Go relay
   STREAM_OPTIONS        默认 1 (向上游请求 usage), 上游报错可设 0
   UPSTREAM_UA           默认浏览器 UA, 绕过上游 Cloudflare 等按 UA 拦截
   MAX_CONNECTIONS       默认 64, 限制并发连接数, 防连接洪水
+  CLIENT_TIMEOUT        默认 60 (秒), 客户端连接读超时, 防 slowloris
 
 仅用 Python 标准库, 无第三方依赖。Python 3.9+。
 """
@@ -30,6 +31,7 @@ OpenCode Go relay
 import hmac
 import json
 import os
+import signal
 import sys
 import threading
 import time
@@ -43,11 +45,25 @@ GO_KEY = os.environ.get("OPENCODE_GO_API_KEY", "").strip()
 RELAY_TOKEN = os.environ.get("RELAY_TOKEN", "").strip()
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "deepseek-v4-flash").strip()
 HOST = os.environ.get("HOST", "0.0.0.0")
-PORT = int(os.environ.get("PORT", "8787"))
-REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "600"))
+
+
+def _env_number(name, default, cast=int):
+    raw = os.environ.get(name, "")
+    if not raw:
+        return default
+    try:
+        return cast(raw)
+    except ValueError:
+        sys.stderr.write("ERROR: %s must be a number, got %r\n" % (name, raw))
+        sys.exit(1)
+
+
+PORT = _env_number("PORT", 8787)
+REQUEST_TIMEOUT = _env_number("REQUEST_TIMEOUT", 600, cast=float)
 USE_STREAM_OPTIONS = os.environ.get("STREAM_OPTIONS", "1") != "0"
 MAX_BODY = 64 * 1024 * 1024  # 64 MB
-MAX_CONNECTIONS = int(os.environ.get("MAX_CONNECTIONS", "64"))
+MAX_CONNECTIONS = _env_number("MAX_CONNECTIONS", 64)
+CLIENT_TIMEOUT = _env_number("CLIENT_TIMEOUT", 60)
 
 # Cloudflare 等上游会按请求签名拦截 urllib 默认的 Python UA，这里给一个浏览器 UA 兜底。
 UPSTREAM_UA = os.environ.get(
@@ -313,13 +329,17 @@ def chat_to_anthropic(data, requested_model):
     if not content:
         content = [{"type": "text", "text": ""}]
     usage = data.get("usage") or {}
+    stop_reason = {
+        "tool_calls": "tool_use",
+        "length": "max_tokens",
+    }.get(choice.get("finish_reason"), "end_turn")
     return {
         "id": _uuid("msg_"),
         "type": "message",
         "role": "assistant",
         "model": requested_model,
         "content": content,
-        "stop_reason": "tool_use" if choice.get("finish_reason") == "tool_calls" else "end_turn",
+        "stop_reason": stop_reason,
         "stop_sequence": None,
         "usage": {
             "input_tokens": usage.get("prompt_tokens", 0),
@@ -357,6 +377,8 @@ def anthropic_sse_translator(upstream, requested_model):
     })
 
     for line in iter_sse_lines(upstream):
+        if b"<html" in line.lower():
+            raise RuntimeError("upstream returned an HTML error page instead of SSE")
         chunk = parse_sse_json(line)
         if not chunk:
             continue
@@ -417,6 +439,8 @@ def anthropic_sse_translator(upstream, requested_model):
                 stop_reason = "tool_use"
             elif fr == "stop" and stop_reason is None:
                 stop_reason = "end_turn"
+            elif fr == "length" and stop_reason is None:
+                stop_reason = "max_tokens"
 
     stop_indexes = []
     if text_open:
@@ -428,13 +452,12 @@ def anthropic_sse_translator(upstream, requested_model):
         yield ev("content_block_stop", {
             "type": "content_block_stop", "index": idx})
 
-    if stop_reason is None:
-        stop_reason = "end_turn"
     started_tool_block = any(
         st["block_index"] is not None for st in tools.values())
     if started_tool_block:
         stop_reason = "tool_use"
-    else:
+    elif stop_reason is None or stop_reason == "tool_use":
+        # 上游 finish_reason 说 tool_calls, 但没发出可用的 tool block -> 回退 end_turn
         stop_reason = "end_turn"
 
     yield ev("message_delta", {
@@ -571,6 +594,7 @@ def chat_to_responses(data, requested_model):
     """把 OpenAI chat.completion (非流式) 转回 Responses 对象。"""
     choice = (data.get("choices") or [{}])[0]
     m = choice.get("message") or {}
+    incomplete = choice.get("finish_reason") == "length"
     output = []
     text = m.get("content")
     if text:
@@ -596,7 +620,7 @@ def chat_to_responses(data, requested_model):
         "id": _uuid("resp_"),
         "object": "response",
         "created_at": int(time.time()),
-        "status": "completed",
+        "status": "incomplete" if incomplete else "completed",
         "model": requested_model,
         "output": output,
         "usage": {
@@ -604,6 +628,7 @@ def chat_to_responses(data, requested_model):
             "output_tokens": usage.get("completion_tokens", 0),
             "total_tokens": usage.get("total_tokens", 0),
         },
+        "incomplete_details": {"reason": "max_output_tokens"} if incomplete else None,
         "error": None,
     }
 
@@ -637,8 +662,22 @@ def responses_sse_translator(upstream, requested_model):
             "usage": None,
         },
     })
+    yield ev("response.in_progress", {
+        "type": "response.in_progress",
+        "response": {
+            "id": resp_id,
+            "object": "response",
+            "created_at": created_at,
+            "status": "in_progress",
+            "model": requested_model,
+            "output": [],
+            "usage": None,
+        },
+    })
 
     for line in iter_sse_lines(upstream):
+        if b"<html" in line.lower():
+            raise RuntimeError("upstream returned an HTML error page instead of SSE")
         chunk = parse_sse_json(line)
         if not chunk:
             continue
@@ -722,6 +761,8 @@ def responses_sse_translator(upstream, requested_model):
                 stop_reason = "tool_use"
             elif fr == "stop" and stop_reason is None:
                 stop_reason = "end_turn"
+            elif fr == "length" and stop_reason is None:
+                stop_reason = "max_tokens"
 
     output = []
     if text_open:
@@ -779,13 +820,14 @@ def responses_sse_translator(upstream, requested_model):
         })
         output.append(item)
 
+    incomplete = stop_reason == "max_tokens"
     yield ev("response.completed", {
         "type": "response.completed",
         "response": {
             "id": resp_id,
             "object": "response",
             "created_at": created_at,
-            "status": "completed",
+            "status": "incomplete" if incomplete else "completed",
             "model": requested_model,
             "output": output,
             "usage": {
@@ -793,6 +835,7 @@ def responses_sse_translator(upstream, requested_model):
                 "output_tokens": usage.get("completion_tokens", 0),
                 "total_tokens": usage.get("total_tokens", 0),
             },
+            "incomplete_details": {"reason": "max_output_tokens"} if incomplete else None,
         },
     })
 
@@ -823,13 +866,19 @@ class RelayHandler(BaseHTTPRequestHandler):
         return False
 
     def _get_api_key(self):
-        """从请求头提取客户端携带的上游 key (Claude Code 的 ANTHROPIC_AUTH_TOKEN 即走这里)。"""
+        """从请求头提取客户端携带的上游 key (Claude Code 的 ANTHROPIC_AUTH_TOKEN 即走这里)。
+
+        排除与 RELAY_TOKEN 相同的值, 避免把 relay 门禁 token 误当上游 key 转发。
+        """
         auth = self.headers.get("Authorization", "")
         if auth.startswith("Bearer "):
             key = auth[7:].strip()
-            if key:
+            if key and (not RELAY_TOKEN or not hmac.compare_digest(key, RELAY_TOKEN)):
                 return key
-        return self.headers.get("x-api-key", "").strip()
+        xkey = self.headers.get("x-api-key", "").strip()
+        if xkey and (not RELAY_TOKEN or not hmac.compare_digest(xkey, RELAY_TOKEN)):
+            return xkey
+        return ""
 
     def _upstream_api_key(self):
         """本次请求使用的上游 key。设置过 GO_KEY 就统一用它 (服务器级模式);
@@ -888,7 +937,11 @@ class RelayHandler(BaseHTTPRequestHandler):
         if length > MAX_BODY:
             self._send_json(413, {"error": {"message": "request body too large"}})
             return None
-        raw = self.rfile.read(length)
+        try:
+            raw = self.rfile.read(length)
+        except (TimeoutError, ConnectionResetError):
+            self._send_json(408, {"error": {"message": "request body read timed out"}})
+            return None
         try:
             return json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
@@ -907,7 +960,7 @@ class RelayHandler(BaseHTTPRequestHandler):
         status = exc.code
         raw = ""
         try:
-            raw = exc.read().decode("utf-8", "replace")
+            raw = exc.read(65536).decode("utf-8", "replace")
         except Exception:
             pass
         if raw and (raw.lstrip().startswith("<") or "<html" in raw[:1024].lower()):
@@ -998,7 +1051,15 @@ class RelayHandler(BaseHTTPRequestHandler):
 
         try:
             if not chat["stream"]:
-                data = json.loads(upstream.read().decode("utf-8"))
+                try:
+                    data = json.loads(upstream.read().decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    self._send_json(502, {
+                        "type": "error",
+                        "error": {"type": "api_error",
+                                  "message": "upstream returned non-JSON response"},
+                    })
+                    return
                 self._send_json(200, chat_to_anthropic(data, requested_model))
             else:
                 self._start_sse()
@@ -1033,7 +1094,13 @@ class RelayHandler(BaseHTTPRequestHandler):
 
         try:
             if not chat["stream"]:
-                data = json.loads(upstream.read().decode("utf-8"))
+                try:
+                    data = json.loads(upstream.read().decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    self._send_json(502, {
+                        "error": {"message": "upstream returned non-JSON response"},
+                    })
+                    return
                 self._send_json(200, chat_to_responses(data, requested_model))
             else:
                 self._start_sse()
@@ -1090,6 +1157,7 @@ class LimitedThreadingHTTPServer(ThreadingHTTPServer):
     def process_request(self, request, client_address):
         self._conn_slots.acquire()
         try:
+            request.settimeout(CLIENT_TIMEOUT)
             super().process_request(request, client_address)
         except Exception:
             self._conn_slots.release()
@@ -1113,6 +1181,13 @@ def main():
             "Set RELAY_TOKEN or restrict access (e.g. IP allowlist) before "
             "exposing it publicly.\n")
     server = LimitedThreadingHTTPServer((HOST, PORT), RelayHandler)
+
+    def _shutdown(signum, frame):
+        sys.stderr.write("signal %d received, shutting down\n" % signum)
+        # shutdown() 会阻塞等待 serve_forever 退出, 不能在主线程的信号处理器里直接调
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _shutdown)
     sys.stderr.write(
         "OpenCode Go relay listening on http://%s:%d -> %s (model: %s)\n"
         % (HOST, PORT, UPSTREAM_BASE, DEFAULT_MODEL))
