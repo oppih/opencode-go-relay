@@ -44,6 +44,13 @@ REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "600"))
 USE_STREAM_OPTIONS = os.environ.get("STREAM_OPTIONS", "1") != "0"
 MAX_BODY = 64 * 1024 * 1024  # 64 MB
 
+# Cloudflare 等上游会按请求签名拦截 urllib 默认的 Python UA，这里给一个浏览器 UA 兜底。
+UPSTREAM_UA = os.environ.get(
+    "UPSTREAM_UA",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+).strip()
+
 
 def _uuid(prefix=""):
     return prefix + uuid.uuid4().hex[:24]
@@ -66,6 +73,7 @@ def upstream_request(path, payload, headers=None):
     )
     req.add_header("Content-Type", "application/json")
     req.add_header("Authorization", "Bearer " + GO_KEY)
+    req.add_header("User-Agent", UPSTREAM_UA)
     for k, v in (headers or {}).items():
         req.add_header(k, v)
     return urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT)
