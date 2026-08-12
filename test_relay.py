@@ -24,6 +24,7 @@ RELAY_PY = os.path.join(SCRIPT_DIR, "relay.py")
 class MockUpstream(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     last_chat_request = None
+    chat_requests = []
 
     def log_message(self, *args):
         pass
@@ -40,8 +41,34 @@ class MockUpstream(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length else b""
         payload = json.loads(raw.decode("utf-8"))
         MockUpstream.last_chat_request = payload
+        MockUpstream.chat_requests.append(payload)
+        user_text = "\n".join(
+            str(m.get("content", ""))
+            for m in payload.get("messages") or []
+            if isinstance(m.get("content"), str)
+        )
+
+        if "TRIGGER_HTML_ERROR" in user_text:
+            self._send(502, "text/html", b"<html><body>cloudflare blocked</body></html>")
+            return
 
         if not payload.get("stream"):
+            if "TRIGGER_EMPTY_CONTENT" in user_text:
+                body = {
+                    "id": "chatcmpl-mock",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "deepseek-v4-flash",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": None},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 1,
+                              "total_tokens": 4},
+                }
+                self._send(200, "application/json", json.dumps(body).encode("utf-8"))
+                return
             body = {
                 "id": "chatcmpl-mock",
                 "object": "chat.completion",
@@ -72,23 +99,71 @@ class MockUpstream(BaseHTTPRequestHandler):
             self._send(200, "application/json", json.dumps(body).encode("utf-8"))
             return
 
+        if "TRIGGER_RETRY" in user_text and payload.get("stream_options"):
+            err = {"error": {"message": "stream_options unsupported"}}
+            self._send(400, "application/json", json.dumps(err).encode("utf-8"))
+            return
+
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Connection", "close")
         self.end_headers()
 
-        chunks = [
-            {"id": "chatcmpl-mock", "object": "chat.completion.chunk", "created": 1,
-             "model": "deepseek-v4-flash",
-             "choices": [{"index": 0, "delta": {"role": "assistant", "content": "Hello"},
-                          "finish_reason": None}]},
-            {"choices": [{"index": 0, "delta": {"tool_calls": [{
-                "index": 0, "id": "call_1",
-                "function": {"name": "Bash", "arguments": '{"command": "ls"}'}}]},
-                "finish_reason": None}]},
-            {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
-             "usage": {"prompt_tokens": 11, "completion_tokens": 5, "total_tokens": 16}},
-        ]
+        if "TRIGGER_SSE_ERROR" in user_text:
+            chunks = [
+                {"id": "chatcmpl-mock", "object": "chat.completion.chunk", "created": 1,
+                 "model": "deepseek-v4-flash",
+                 "choices": [{"index": 0, "delta": {"content": "Hello"},
+                              "finish_reason": None}]},
+                {"choices": [{"index": 0, "delta": "oops"}]},
+            ]
+        elif "TRIGGER_MULTI_TOOL" in user_text:
+            chunks = [
+                {"id": "chatcmpl-mock", "object": "chat.completion.chunk", "created": 1,
+                 "model": "deepseek-v4-flash",
+                 "choices": [{"index": 0, "delta": {"content": "Hello"},
+                              "finish_reason": None}]},
+                {"choices": [{"index": 0, "delta": {"tool_calls": [
+                    {"index": 0, "id": "call_1",
+                     "function": {"name": "Bash", "arguments": '{"command": "ls"}'}},
+                    {"index": 1, "id": "call_2",
+                     "function": {"name": "Read", "arguments": '{"path": "/tmp"}'}},
+                ]}, "finish_reason": None}]},
+                {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                 "usage": {"prompt_tokens": 11, "completion_tokens": 5,
+                           "total_tokens": 16}},
+            ]
+        elif "TRIGGER_TOOL_FIRST" in user_text:
+            chunks = [
+                {"choices": [{"index": 0, "delta": {"tool_calls": [
+                    {"index": 0, "id": "call_1",
+                     "function": {"name": "Bash", "arguments": '{"a":1}'}}]},
+                    "finish_reason": None}]},
+                {"choices": [{"index": 0, "delta": {"content": "done"},
+                              "finish_reason": None}]},
+                {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+            ]
+        elif "TRIGGER_MISSING_TOOL_NAME" in user_text:
+            chunks = [
+                {"choices": [{"index": 0, "delta": {"tool_calls": [
+                    {"index": 0, "function": {"arguments": '{"x":1}'}}]},
+                    "finish_reason": None}]},
+                {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+            ]
+        else:
+            chunks = [
+                {"id": "chatcmpl-mock", "object": "chat.completion.chunk", "created": 1,
+                 "model": "deepseek-v4-flash",
+                 "choices": [{"index": 0, "delta": {"role": "assistant", "content": "Hello"},
+                              "finish_reason": None}]},
+                {"choices": [{"index": 0, "delta": {"tool_calls": [{
+                    "index": 0, "id": "call_1",
+                    "function": {"name": "Bash", "arguments": '{"command": "ls"}'}}]},
+                    "finish_reason": None}]},
+                {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                 "usage": {"prompt_tokens": 11, "completion_tokens": 5,
+                           "total_tokens": 16}},
+            ]
         for c in chunks:
             self.wfile.write(b"data: " + json.dumps(c).encode("utf-8") + b"\n\n")
             self.wfile.flush()
@@ -313,6 +388,161 @@ def test_models(base):
     print("PASS models")
 
 
+def test_anthropic_stream_midstream_error(base):
+    req = dict(ANTHROPIC_REQUEST)
+    req["stream"] = True
+    req["messages"] = [{"role": "user", "content": "TRIGGER_SSE_ERROR"}]
+    status, text, ctype = post(base + "/v1/messages", req)
+    assert status == 200, (status, text)
+    assert "text/event-stream" in ctype
+    assert "HTTP/1.1 502" not in text, "HTTP status line leaked into SSE stream"
+    events = parse_sse_events(text)
+    errors = [d for e, d in events if e == "error"]
+    assert errors, "expected an SSE error event, got %s" % [e for e, _ in events]
+    assert errors[0]["type"] == "error"
+    print("PASS anthropic stream midstream error -> SSE error event")
+
+
+def test_responses_stream_indices(base):
+    req = dict(RESPONSES_REQUEST)
+    req["stream"] = True
+    req["input"] = [{"role": "user", "content": "TRIGGER_MULTI_TOOL"}]
+    status, text, _ = post(base + "/v1/responses", req)
+    assert status == 200, (status, text)
+    events = parse_sse_events(text)
+    added = [d for e, d in events if e == "response.output_item.added"]
+    idxs = [d["output_index"] for d in added]
+    assert idxs == [0, 1, 2], idxs
+    done_fc = [d for e, d in events if e == "response.function_call_arguments.done"]
+    assert [d["output_index"] for d in done_fc] == [1, 2], done_fc
+    completed = [d for e, d in events if e == "response.completed"][0]
+    types = [o["type"] for o in completed["response"]["output"]]
+    assert types == ["message", "function_call", "function_call"], types
+    print("PASS responses stream output_index increments")
+
+
+def test_anthropic_tool_first_block_order(base):
+    req = dict(ANTHROPIC_REQUEST)
+    req["stream"] = True
+    req["messages"] = [{"role": "user", "content": "TRIGGER_TOOL_FIRST"}]
+    status, text, _ = post(base + "/v1/messages", req)
+    assert status == 200, (status, text)
+    events = parse_sse_events(text)
+    starts = [d for e, d in events if e == "content_block_start"]
+    idxs = [d["index"] for d in starts]
+    types = [d["content_block"]["type"] for d in starts]
+    assert idxs == [0, 1] and types == ["tool_use", "text"], (idxs, types)
+    stops = [d["index"] for e, d in events if e == "content_block_stop"]
+    assert stops == [0, 1], stops
+    md = [d for e, d in events if e == "message_delta"][0]
+    assert md["delta"]["stop_reason"] == "tool_use"
+    print("PASS anthropic tool-first block ordering")
+
+
+def test_anthropic_missing_tool_name(base):
+    req = dict(ANTHROPIC_REQUEST)
+    req["stream"] = True
+    req["messages"] = [{"role": "user", "content": "TRIGGER_MISSING_TOOL_NAME"}]
+    status, text, _ = post(base + "/v1/messages", req)
+    assert status == 200, (status, text)
+    events = parse_sse_events(text)
+    starts = [d for e, d in events if e == "content_block_start"]
+    assert not [d for d in starts if d["content_block"]["type"] == "tool_use"]
+    md = [d for e, d in events if e == "message_delta"][0]
+    assert md["delta"]["stop_reason"] == "end_turn", md
+    print("PASS anthropic missing tool name -> end_turn")
+
+
+def test_anthropic_html_upstream_error(base):
+    req = dict(ANTHROPIC_REQUEST)
+    req["stream"] = False
+    req["messages"] = [{"role": "user", "content": "TRIGGER_HTML_ERROR"}]
+    r = urllib.request.Request(base + "/v1/messages",
+                               data=json.dumps(req).encode("utf-8"), method="POST")
+    r.add_header("Content-Type", "application/json")
+    r.add_header("Authorization", "Bearer secret")
+    try:
+        urllib.request.urlopen(r, timeout=30)
+        assert False, "should have errored"
+    except urllib.error.HTTPError as exc:
+        body = json.loads(exc.read().decode("utf-8"))
+        assert exc.code == 502
+        msg = body["error"]["message"]
+        assert msg == "upstream request failed", msg
+        assert "<html" not in msg and "blocked" not in msg
+    print("PASS upstream html error sanitized")
+
+
+def test_anthropic_empty_content_fallback(base):
+    req = dict(ANTHROPIC_REQUEST)
+    req["stream"] = False
+    req["messages"] = [{"role": "user", "content": "TRIGGER_EMPTY_CONTENT"}]
+    status, text, _ = post(base + "/v1/messages", req)
+    assert status == 200, (status, text)
+    msg = json.loads(text)
+    assert msg["content"] == [{"type": "text", "text": ""}], msg["content"]
+    assert msg["stop_reason"] == "end_turn"
+    print("PASS anthropic empty content fallback")
+
+
+def test_stream_options_retry(base):
+    MockUpstream.chat_requests.clear()
+    req = dict(RESPONSES_REQUEST)
+    req["stream"] = True
+    req["input"] = [{"role": "user", "content": "TRIGGER_RETRY"}]
+    status, text, _ = post(base + "/v1/responses", req)
+    assert status == 200, (status, text)
+    assert len(MockUpstream.chat_requests) == 2, len(MockUpstream.chat_requests)
+    assert "stream_options" in MockUpstream.chat_requests[0]
+    assert "stream_options" not in MockUpstream.chat_requests[1]
+    print("PASS stream_options auto-retry")
+
+
+def raw_post(port, request_head, body=b""):
+    import socket
+    s = socket.create_connection(("127.0.0.1", port), timeout=10)
+    s.sendall(request_head + body)
+    s.shutdown(socket.SHUT_WR)
+    data = b""
+    while True:
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        data += chunk
+    s.close()
+    return data
+
+
+def test_bad_content_length(base, port):
+    host = base.split("://")[1]
+    head = (
+        "POST /v1/messages HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Authorization: Bearer secret\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: abc\r\n"
+        "\r\n" % host
+    ).encode("utf-8")
+    data = raw_post(port, head)
+    assert data.startswith(b"HTTP/1.1 400"), data[:120]
+    print("PASS malformed Content-Length -> 400")
+
+
+def test_chunked_rejected(base, port):
+    host = base.split("://")[1]
+    head = (
+        "POST /v1/messages HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Authorization: Bearer secret\r\n"
+        "Content-Type: application/json\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n" % host
+    ).encode("utf-8")
+    data = raw_post(port, head, body=b"0\r\n\r\n")
+    assert data.startswith(b"HTTP/1.1 400"), data[:120]
+    print("PASS chunked Transfer-Encoding -> 400")
+
+
 def main():
     import tempfile
     mock, mock_port = start_mock()
@@ -352,6 +582,15 @@ def main():
         test_responses_nonstream(base)
         test_responses_stream(base)
         test_chat_passthrough(base)
+        test_anthropic_stream_midstream_error(base)
+        test_responses_stream_indices(base)
+        test_anthropic_tool_first_block_order(base)
+        test_anthropic_missing_tool_name(base)
+        test_anthropic_html_upstream_error(base)
+        test_anthropic_empty_content_fallback(base)
+        test_stream_options_retry(base)
+        test_bad_content_length(base, relay_port)
+        test_chunked_rejected(base, relay_port)
         print("\nAll tests passed.")
     finally:
         proc.terminate()

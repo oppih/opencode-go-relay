@@ -21,13 +21,17 @@ OpenCode Go relay
   UPSTREAM_BASE         默认 https://opencode.ai/zen/go/v1
   HOST / PORT           默认 0.0.0.0:8787
   STREAM_OPTIONS        默认 1 (向上游请求 usage), 上游报错可设 0
+  UPSTREAM_UA           默认浏览器 UA, 绕过上游 Cloudflare 等按 UA 拦截
+  MAX_CONNECTIONS       默认 64, 限制并发连接数, 防连接洪水
 
 仅用 Python 标准库, 无第三方依赖。Python 3.9+。
 """
 
+import hmac
 import json
 import os
 import sys
+import threading
 import time
 import uuid
 import urllib.error
@@ -43,6 +47,7 @@ PORT = int(os.environ.get("PORT", "8787"))
 REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "600"))
 USE_STREAM_OPTIONS = os.environ.get("STREAM_OPTIONS", "1") != "0"
 MAX_BODY = 64 * 1024 * 1024  # 64 MB
+MAX_CONNECTIONS = int(os.environ.get("MAX_CONNECTIONS", "64"))
 
 # Cloudflare 等上游会按请求签名拦截 urllib 默认的 Python UA，这里给一个浏览器 UA 兜底。
 UPSTREAM_UA = os.environ.get(
@@ -150,7 +155,6 @@ def _append_assistant(messages, text, tool_calls):
     if text:
         msg["content"] = text
     if tool_calls:
-        msg["content"] = msg.get("content")
         msg["tool_calls"] = tool_calls
     messages.append(msg)
 
@@ -303,6 +307,8 @@ def chat_to_anthropic(data, requested_model):
             "name": fn.get("name", ""),
             "input": args,
         })
+    if not content:
+        content = [{"type": "text", "text": ""}]
     usage = data.get("usage") or {}
     return {
         "id": _uuid("msg_"),
@@ -323,6 +329,7 @@ def anthropic_sse_translator(upstream, requested_model):
     """把上游 chat.completions 的 SSE 增量翻译成 Anthropic 的 SSE 事件。"""
     msg_id = _uuid("msg_")
     text_open = False
+    text_block_index = None
     tools = {}
     next_block_index = 0
     stop_reason = None
@@ -359,16 +366,17 @@ def anthropic_sse_translator(upstream, requested_model):
             text = delta.get("content")
             if text:
                 if not text_open:
+                    text_block_index = next_block_index
+                    next_block_index += 1
                     yield ev("content_block_start", {
                         "type": "content_block_start",
-                        "index": 0,
+                        "index": text_block_index,
                         "content_block": {"type": "text", "text": ""},
                     })
                     text_open = True
-                    next_block_index = 1
                 yield ev("content_block_delta", {
                     "type": "content_block_delta",
-                    "index": 0,
+                    "index": text_block_index,
                     "delta": {"type": "text_delta", "text": text},
                 })
 
@@ -407,17 +415,24 @@ def anthropic_sse_translator(upstream, requested_model):
             elif fr == "stop" and stop_reason is None:
                 stop_reason = "end_turn"
 
+    stop_indexes = []
     if text_open:
-        yield ev("content_block_stop", {"type": "content_block_stop", "index": 0})
+        stop_indexes.append(text_block_index)
     for st in tools.values():
         if st["block_index"] is not None:
-            yield ev("content_block_stop", {
-                "type": "content_block_stop", "index": st["block_index"]})
+            stop_indexes.append(st["block_index"])
+    for idx in sorted(stop_indexes):
+        yield ev("content_block_stop", {
+            "type": "content_block_stop", "index": idx})
 
     if stop_reason is None:
         stop_reason = "end_turn"
-    if tools and stop_reason == "end_turn":
+    started_tool_block = any(
+        st["block_index"] is not None for st in tools.values())
+    if started_tool_block:
         stop_reason = "tool_use"
+    else:
+        stop_reason = "end_turn"
 
     yield ev("message_delta", {
         "type": "message_delta",
@@ -597,6 +612,8 @@ def responses_sse_translator(upstream, requested_model):
     msg_item_id = _uuid("msg_")
     text_buf = []
     text_open = False
+    text_index = None
+    next_output_index = 0
     fc_states = {}
     usage = {}
     stop_reason = None
@@ -632,9 +649,11 @@ def responses_sse_translator(upstream, requested_model):
             if text:
                 if not text_open:
                     text_open = True
+                    text_index = next_output_index
+                    next_output_index += 1
                     yield ev("response.output_item.added", {
                         "type": "response.output_item.added",
-                        "output_index": 0,
+                        "output_index": text_index,
                         "item": {
                             "id": msg_item_id,
                             "type": "message",
@@ -646,7 +665,7 @@ def responses_sse_translator(upstream, requested_model):
                     yield ev("response.content_part.added", {
                         "type": "response.content_part.added",
                         "item_id": msg_item_id,
-                        "output_index": 0,
+                        "output_index": text_index,
                         "content_index": 0,
                         "part": {"type": "output_text", "text": "", "annotations": []},
                     })
@@ -654,7 +673,7 @@ def responses_sse_translator(upstream, requested_model):
                 yield ev("response.output_text.delta", {
                     "type": "response.output_text.delta",
                     "item_id": msg_item_id,
-                    "output_index": 0,
+                    "output_index": text_index,
                     "content_index": 0,
                     "delta": text,
                 })
@@ -662,7 +681,8 @@ def responses_sse_translator(upstream, requested_model):
             for tc in delta.get("tool_calls") or []:
                 idx = tc.get("index", 0)
                 st = fc_states.setdefault(idx, {
-                    "id": None, "name": None, "args": [], "item_id": None})
+                    "id": None, "name": None, "args": [],
+                    "item_id": None, "output_index": None})
                 if tc.get("id"):
                     st["id"] = tc["id"]
                 fn = tc.get("function") or {}
@@ -673,9 +693,11 @@ def responses_sse_translator(upstream, requested_model):
                     st["args"].append(args)
                 if st["item_id"] is None and st["id"] and st["name"]:
                     st["item_id"] = _uuid("fc_")
+                    st["output_index"] = next_output_index
+                    next_output_index += 1
                     yield ev("response.output_item.added", {
                         "type": "response.output_item.added",
-                        "output_index": 0,
+                        "output_index": st["output_index"],
                         "item": {
                             "id": st["item_id"],
                             "type": "function_call",
@@ -689,7 +711,7 @@ def responses_sse_translator(upstream, requested_model):
                     yield ev("response.function_call_arguments.delta", {
                         "type": "response.function_call_arguments.delta",
                         "item_id": st["item_id"],
-                        "output_index": 0,
+                        "output_index": st["output_index"],
                         "delta": args,
                     })
 
@@ -711,20 +733,20 @@ def responses_sse_translator(upstream, requested_model):
         yield ev("response.output_text.done", {
             "type": "response.output_text.done",
             "item_id": msg_item_id,
-            "output_index": 0,
+            "output_index": text_index,
             "content_index": 0,
             "text": full_text,
         })
         yield ev("response.content_part.done", {
             "type": "response.content_part.done",
             "item_id": msg_item_id,
-            "output_index": 0,
+            "output_index": text_index,
             "content_index": 0,
             "part": {"type": "output_text", "text": full_text, "annotations": []},
         })
         yield ev("response.output_item.done", {
             "type": "response.output_item.done",
-            "output_index": 0,
+            "output_index": text_index,
             "item": msg_item,
         })
         output.append(msg_item)
@@ -744,12 +766,12 @@ def responses_sse_translator(upstream, requested_model):
         yield ev("response.function_call_arguments.done", {
             "type": "response.function_call_arguments.done",
             "item_id": st["item_id"],
-            "output_index": 0,
+            "output_index": st["output_index"],
             "arguments": full_args,
         })
         yield ev("response.output_item.done", {
             "type": "response.output_item.done",
-            "output_index": 0,
+            "output_index": st["output_index"],
             "item": item,
         })
         output.append(item)
@@ -790,9 +812,10 @@ class RelayHandler(BaseHTTPRequestHandler):
         if not RELAY_TOKEN:
             return True
         auth = self.headers.get("Authorization", "")
-        if auth.startswith("Bearer ") and auth[7:].strip() == RELAY_TOKEN:
-            return True
-        if self.headers.get("x-api-key", "").strip() == RELAY_TOKEN:
+        if auth.startswith("Bearer "):
+            if hmac.compare_digest(auth[7:].strip(), RELAY_TOKEN):
+                return True
+        if hmac.compare_digest(self.headers.get("x-api-key", "").strip(), RELAY_TOKEN):
             return True
         return False
 
@@ -817,9 +840,31 @@ class RelayHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
 
+    def _send_sse_error(self, message, anthropic_style):
+        """SSE 头已发出后再出错时, 在流内写 error 事件而不是回写 HTTP 状态行。"""
+        if anthropic_style:
+            data = {"type": "error", "error": {"type": "api_error", "message": message}}
+        else:
+            data = {"type": "error", "code": "api_error", "message": message}
+        try:
+            self.wfile.write(b"event: error\ndata: " + json_bytes(data) + b"\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
     def _read_body(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        if length <= 0:
+        if self.headers.get("Transfer-Encoding", "").strip().lower() not in ("", "identity"):
+            self._send_json(400, {"error": {"message": "Transfer-Encoding not supported"}})
+            return None
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            self._send_json(400, {"error": {"message": "invalid Content-Length"}})
+            return None
+        if length < 0:
+            self._send_json(400, {"error": {"message": "invalid Content-Length"}})
+            return None
+        if length == 0:
             return {}
         if length > MAX_BODY:
             self._send_json(413, {"error": {"message": "request body too large"}})
@@ -846,6 +891,8 @@ class RelayHandler(BaseHTTPRequestHandler):
             raw = exc.read().decode("utf-8", "replace")
         except Exception:
             pass
+        if raw and (raw.lstrip().startswith("<") or "<html" in raw[:1024].lower()):
+            raw = ""
         if anthropic_style:
             self._send_json(status, {
                 "type": "error",
@@ -930,13 +977,10 @@ class RelayHandler(BaseHTTPRequestHandler):
                 self._send_json(200, chat_to_anthropic(data, requested_model))
             else:
                 self._start_sse()
-                self._write_chunks(anthropic_sse_translator(upstream, requested_model))
-        except Exception as exc:
-            if not self.wfile.closed:
-                self._send_json(502, {
-                    "type": "error",
-                    "error": {"type": "api_error", "message": str(exc)},
-                })
+                try:
+                    self._write_chunks(anthropic_sse_translator(upstream, requested_model))
+                except Exception as exc:
+                    self._send_sse_error(str(exc), anthropic_style=True)
         finally:
             upstream.close()
 
@@ -968,10 +1012,10 @@ class RelayHandler(BaseHTTPRequestHandler):
                 self._send_json(200, chat_to_responses(data, requested_model))
             else:
                 self._start_sse()
-                self._write_chunks(responses_sse_translator(upstream, requested_model))
-        except Exception as exc:
-            if not self.wfile.closed:
-                self._send_json(502, {"error": {"message": str(exc)}})
+                try:
+                    self._write_chunks(responses_sse_translator(upstream, requested_model))
+                except Exception as exc:
+                    self._send_sse_error(str(exc), anthropic_style=False)
         finally:
             upstream.close()
 
@@ -1009,6 +1053,30 @@ class RelayHandler(BaseHTTPRequestHandler):
             upstream.close()
 
 
+class LimitedThreadingHTTPServer(ThreadingHTTPServer):
+    """每连接一线程, 但用信号量限制并发, 防公网连接洪水。"""
+
+    daemon_threads = True
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._conn_slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+
+    def process_request(self, request, client_address):
+        self._conn_slots.acquire()
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._conn_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._conn_slots.release()
+
+
 def main():
     if not GO_KEY:
         sys.stderr.write(
@@ -1017,8 +1085,7 @@ def main():
         sys.stderr.write(
             "WARNING: RELAY_TOKEN is empty; anyone can use this relay. "
             "Set RELAY_TOKEN before exposing it publicly.\n")
-    server = ThreadingHTTPServer((HOST, PORT), RelayHandler)
-    server.daemon_threads = True
+    server = LimitedThreadingHTTPServer((HOST, PORT), RelayHandler)
     sys.stderr.write(
         "OpenCode Go relay listening on http://%s:%d -> %s (model: %s)\n"
         % (HOST, PORT, UPSTREAM_BASE, DEFAULT_MODEL))

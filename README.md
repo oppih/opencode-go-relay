@@ -51,6 +51,8 @@ python3 test_relay.py
 | `HOST` / `PORT` | `0.0.0.0` / `8787` | Listen address. |
 | `STREAM_OPTIONS` | `1` | Send `stream_options.include_usage` upstream; set `0` if the upstream rejects it. |
 | `REQUEST_TIMEOUT` | `600` | Upstream request timeout (seconds). |
+| `UPSTREAM_UA` | *(browser UA)* | User-Agent sent upstream; some edges (e.g. Cloudflare) reject urllib's default. |
+| `MAX_CONNECTIONS` | `64` | Max concurrent connections; excess connections wait (backpressure). |
 
 ### Endpoints
 
