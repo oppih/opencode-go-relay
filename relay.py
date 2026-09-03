@@ -17,6 +17,7 @@ OpenCode Go relay
 环境变量:
   OPENCODE_GO_API_KEY   可选, 设置后所有请求共用该 key; 留空则每个请求必须自带 key
   RELAY_TOKEN           可选, 强烈建议公网部署时设置, 客户端用它鉴权
+  RELAY_SESSION_ID      可选, 客户端未提供 x-opencode-session 时使用的稳定会话 ID
   DEFAULT_MODEL         默认 deepseek-v4-flash
   UPSTREAM_BASE         默认 https://opencode.ai/zen/go/v1
   HOST / PORT           默认 0.0.0.0:8787
@@ -43,6 +44,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 UPSTREAM_BASE = os.environ.get("UPSTREAM_BASE", "https://opencode.ai/zen/go/v1").rstrip("/")
 GO_KEY = os.environ.get("OPENCODE_GO_API_KEY", "").strip()
 RELAY_TOKEN = os.environ.get("RELAY_TOKEN", "").strip()
+RELAY_SESSION_ID = os.environ.get("RELAY_SESSION_ID") or str(uuid.uuid4())
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "deepseek-v4-flash").strip()
 MODELS_EXTRA = [m.strip() for m in os.environ.get("MODELS_EXTRA", "").split(",") if m.strip()]
 HOST = os.environ.get("HOST", "0.0.0.0")
@@ -86,6 +88,15 @@ def json_bytes(obj):
 # 上游请求
 # ---------------------------------------------------------------------------
 
+def _opencode_session_id(incoming_headers):
+    """优先使用客户端会话 ID，否则使用本进程的稳定回退值。"""
+    if incoming_headers is not None:
+        value = incoming_headers.get("x-opencode-session")
+        if value is not None:
+            return value
+    return RELAY_SESSION_ID
+
+
 def upstream_request(path, payload, headers=None, api_key=None):
     """POST 到 OpenCode Go 上游, 返回 http.client.HTTPResponse (可流式读)。
 
@@ -99,8 +110,7 @@ def upstream_request(path, payload, headers=None, api_key=None):
     req.add_header("Content-Type", "application/json")
     req.add_header("Authorization", "Bearer " + (api_key or GO_KEY))
     req.add_header("User-Agent", UPSTREAM_UA)
-    for k, v in (headers or {}).items():
-        req.add_header(k, v)
+    req.add_header("x-opencode-session", _opencode_session_id(headers))
     return urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT)
 
 
@@ -976,6 +986,10 @@ class RelayHandler(BaseHTTPRequestHandler):
             return GO_KEY
         return self._get_api_key()
 
+    def _upstream_request(self, path, payload, api_key):
+        """发送上游请求，并只从入站请求选取会话亲和性 header。"""
+        return upstream_request(path, payload, headers=self.headers, api_key=api_key)
+
     def _send_json(self, status, obj):
         data = json_bytes(obj)
         self.send_response(status)
@@ -1123,13 +1137,13 @@ class RelayHandler(BaseHTTPRequestHandler):
         requested_model = body.get("model") or DEFAULT_MODEL
         chat = anthropic_to_openai(body)
         try:
-            upstream = upstream_request("/chat/completions", chat, api_key=api_key)
+            upstream = self._upstream_request("/chat/completions", chat, api_key)
         except urllib.error.HTTPError as exc:
             if exc.code in (400, 422) and USE_STREAM_OPTIONS and chat.get("stream"):
                 # 某些上游不认 stream_options, 去掉重试一次
                 chat.pop("stream_options", None)
                 try:
-                    upstream = upstream_request("/chat/completions", chat, api_key=api_key)
+                    upstream = self._upstream_request("/chat/completions", chat, api_key)
                 except urllib.error.HTTPError as exc2:
                     self._upstream_error(exc2, anthropic_style=True)
                     return
@@ -1170,12 +1184,12 @@ class RelayHandler(BaseHTTPRequestHandler):
         requested_model = body.get("model") or DEFAULT_MODEL
         chat = responses_to_chat(body)
         try:
-            upstream = upstream_request("/chat/completions", chat, api_key=api_key)
+            upstream = self._upstream_request("/chat/completions", chat, api_key)
         except urllib.error.HTTPError as exc:
             if exc.code in (400, 422) and USE_STREAM_OPTIONS and chat.get("stream"):
                 chat.pop("stream_options", None)
                 try:
-                    upstream = upstream_request("/chat/completions", chat, api_key=api_key)
+                    upstream = self._upstream_request("/chat/completions", chat, api_key)
                 except urllib.error.HTTPError as exc2:
                     self._upstream_error(exc2, anthropic_style=False)
                     return
@@ -1211,7 +1225,7 @@ class RelayHandler(BaseHTTPRequestHandler):
         body = dict(body)
         body["model"] = body.get("model") or DEFAULT_MODEL
         try:
-            upstream = upstream_request("/chat/completions", body, api_key=api_key)
+            upstream = self._upstream_request("/chat/completions", body, api_key)
         except urllib.error.HTTPError as exc:
             self._upstream_error(exc, anthropic_style=False)
             return
@@ -1295,3 +1309,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

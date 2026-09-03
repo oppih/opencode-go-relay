@@ -25,6 +25,7 @@ class MockUpstream(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     last_chat_request = None
     chat_requests = []
+    session_headers = []
     last_auth = None
 
     def log_message(self, *args):
@@ -43,6 +44,7 @@ class MockUpstream(BaseHTTPRequestHandler):
         payload = json.loads(raw.decode("utf-8"))
         MockUpstream.last_chat_request = payload
         MockUpstream.chat_requests.append(payload)
+        MockUpstream.session_headers.append(self.headers.get("x-opencode-session"))
         MockUpstream.last_auth = self.headers.get("Authorization", "")
         user_text = "\n".join(
             str(m.get("content", ""))
@@ -251,11 +253,13 @@ def wait_ready(port, timeout=15):
     return False
 
 
-def post(url, payload, token="secret", timeout=30):
+def post(url, payload, token="secret", timeout=30, headers=None):
     req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
                                  method="POST")
     req.add_header("Content-Type", "application/json")
     req.add_header("Authorization", "Bearer " + token)
+    for key, value in (headers or {}).items():
+        req.add_header(key, value)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.status, resp.read().decode("utf-8"), resp.headers.get("Content-Type", "")
 
@@ -824,6 +828,7 @@ def test_anthropic_empty_content_fallback(base):
 
 def test_stream_options_retry(base):
     MockUpstream.chat_requests.clear()
+    MockUpstream.session_headers.clear()
     req = dict(RESPONSES_REQUEST)
     req["stream"] = True
     req["input"] = [{"role": "user", "content": "TRIGGER_RETRY"}]
@@ -833,6 +838,53 @@ def test_stream_options_retry(base):
     assert "stream_options" in MockUpstream.chat_requests[0]
     assert "stream_options" not in MockUpstream.chat_requests[1]
     print("PASS stream_options auto-retry")
+
+
+def test_opencode_session_header(base):
+    cases = [
+        ("/v1/messages", {"model": "anthropic-model", "max_tokens": 8,
+                          "messages": [{"role": "user", "content": "hello"}]}),
+        ("/v1/responses", {"model": "responses-model", "input": "hello"}),
+        ("/v1/chat/completions", {"model": "chat-model",
+                                  "messages": [{"role": "user", "content": "hello"}]}),
+    ]
+    for stream in (False, True):
+        for index, (path, template) in enumerate(cases):
+            payload = dict(template)
+            payload["stream"] = stream
+            supplied = "client session %d/%s" % (index, "stream" if stream else "json")
+            before = len(MockUpstream.chat_requests)
+            status, _, _ = post(base + path, payload,
+                                headers={"x-opencode-session": supplied})
+            assert status == 200
+            assert MockUpstream.session_headers[before] == supplied
+            assert MockUpstream.chat_requests[before]["model"] == template["model"]
+
+    before = len(MockUpstream.chat_requests)
+    for path, template in cases:
+        payload = dict(template)
+        payload["stream"] = False
+        status, _, _ = post(base + path, payload)
+        assert status == 200
+    fallback_headers = MockUpstream.session_headers[before:]
+    assert fallback_headers == ["test-fallback-session"] * len(cases), fallback_headers
+
+    retries = [
+        ("/v1/messages", {"model": "retry-model", "stream": True,
+                          "max_tokens": 8,
+                          "messages": [{"role": "user", "content": "TRIGGER_RETRY"}]}),
+        ("/v1/responses", {"model": "retry-model", "stream": True,
+                           "input": "TRIGGER_RETRY"}),
+    ]
+    for path, retry in retries:
+        before = len(MockUpstream.chat_requests)
+        status, _, _ = post(base + path, retry,
+                            headers={"x-opencode-session": "retry-session"})
+        assert status == 200
+        assert MockUpstream.session_headers[before:] == ["retry-session", "retry-session"]
+        assert "stream_options" in MockUpstream.chat_requests[before]
+        assert "stream_options" not in MockUpstream.chat_requests[before + 1]
+    print("PASS x-opencode-session forwarding and stable fallback")
 
 
 def raw_post(port, request_head, body=b""):
@@ -887,6 +939,7 @@ def main():
     env.update({
         "OPENCODE_GO_API_KEY": "test-go-key",
         "RELAY_TOKEN": "secret",
+        "RELAY_SESSION_ID": "test-fallback-session",
         "DEFAULT_MODEL": "deepseek-v4-flash",
         "MODELS_EXTRA": "deepseek-v4-pro",
         "UPSTREAM_BASE": "http://127.0.0.1:%d/v1" % mock_port,
@@ -964,6 +1017,7 @@ def main():
         test_anthropic_html_upstream_error(base)
         test_anthropic_empty_content_fallback(base)
         test_stream_options_retry(base)
+        test_opencode_session_header(base)
         test_bad_content_length(base, relay_port)
         test_chunked_rejected(base, relay_port)
         test_nonjson_upstream(base)
@@ -1003,3 +1057,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
