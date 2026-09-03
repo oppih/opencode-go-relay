@@ -467,6 +467,18 @@ def test_models(base):
     print("PASS models")
 
 
+def test_models_extra(base):
+    # MODELS_EXTRA: /v1/models 同时列出 DEFAULT_MODEL 和额外模型
+    req = urllib.request.Request(base + "/v1/models")
+    req.add_header("Authorization", "Bearer secret")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    ids = [m["id"] for m in data["data"]]
+    assert ids[0] == "deepseek-v4-flash"
+    assert "deepseek-v4-pro" in ids, ids
+    print("PASS models_extra")
+
+
 def test_per_request_key(base):
     # 不带 key -> 401
     req = urllib.request.Request(base + "/v1/messages",
@@ -876,6 +888,7 @@ def main():
         "OPENCODE_GO_API_KEY": "test-go-key",
         "RELAY_TOKEN": "secret",
         "DEFAULT_MODEL": "deepseek-v4-flash",
+        "MODELS_EXTRA": "deepseek-v4-pro",
         "UPSTREAM_BASE": "http://127.0.0.1:%d/v1" % mock_port,
         "HOST": "127.0.0.1",
     })
@@ -937,6 +950,7 @@ def main():
             assert False, "relay did not start"
         test_auth(base)
         test_models(base)
+        test_models_extra(base)
         test_anthropic_nonstream(base)
         test_anthropic_stream(base)
         test_responses_nonstream(base)

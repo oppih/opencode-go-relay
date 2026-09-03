@@ -44,6 +44,7 @@ UPSTREAM_BASE = os.environ.get("UPSTREAM_BASE", "https://opencode.ai/zen/go/v1")
 GO_KEY = os.environ.get("OPENCODE_GO_API_KEY", "").strip()
 RELAY_TOKEN = os.environ.get("RELAY_TOKEN", "").strip()
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "deepseek-v4-flash").strip()
+MODELS_EXTRA = [m.strip() for m in os.environ.get("MODELS_EXTRA", "").split(",") if m.strip()]
 HOST = os.environ.get("HOST", "0.0.0.0")
 
 
@@ -1099,15 +1100,20 @@ class RelayHandler(BaseHTTPRequestHandler):
         if path == "/healthz":
             self._send_json(200, {"ok": True})
         elif path == "/v1/models":
-            self._send_json(200, {
-                "object": "list",
-                "data": [{
-                    "id": DEFAULT_MODEL,
+            data = [{
+                "id": DEFAULT_MODEL,
+                "object": "model",
+                "created": 0,
+                "owned_by": "opencode-go",
+            }]
+            for extra in MODELS_EXTRA:
+                data.append({
+                    "id": extra,
                     "object": "model",
                     "created": 0,
                     "owned_by": "opencode-go",
-                }],
-            })
+                })
+            self._send_json(200, {"object": "list", "data": data})
         else:
             self._send_json(404, {"error": {"message": "not found"}})
 
