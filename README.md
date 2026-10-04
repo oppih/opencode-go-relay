@@ -1,8 +1,8 @@
 # OpenCode Go Relay
 
-A zero-dependency protocol bridge that lets **Claude Code** (Anthropic Messages) and **Codex** (OpenAI Responses) share the OpenAI-compatible models in your [OpenCode Go](https://opencode.ai) subscription — default model `deepseek-v4-flash`. Pure Python standard library, single file, no third-party deps.
+A protocol bridge that lets **Claude Code** (Anthropic Messages) and **Codex** (OpenAI Responses) share the models in your [OpenCode Go](https://opencode.ai) subscription — default model `deepseek-v4-flash`. Pure Python standard library, single file (the optional `tiktoken` dependency only improves the `/v1/messages/count_tokens` estimate).
 
-> 中文简介:一个零依赖的协议中转站,让 Claude Code(Anthropic Messages 协议)和 Codex(OpenAI Responses 协议)共用 OpenCode Go 订阅里的 OpenAI 兼容模型。纯 Python 标准库,单文件,无第三方依赖。
+> 中文简介:一个协议中转站,让 Claude Code(Anthropic Messages 协议)和 Codex(OpenAI Responses 协议)共用 OpenCode Go 订阅里的 OpenAI 兼容模型。纯 Python 标准库,单文件(可选依赖 tiktoken 仅用于改进 token 估算)。
 
 ## Why?
 
@@ -23,7 +23,7 @@ OpenCode Go exposes an OpenAI-compatible endpoint (`https://opencode.ai/zen/go/v
 - **`POST /v1/chat/completions`** — pass-through (auth only; the client's model is forwarded, defaulting to `DEFAULT_MODEL` when omitted)
 - **`GET /v1/models`**, **`GET /healthz`**
 - Token auth (`RELAY_TOKEN`), 64 MB body cap, `stream_options` auto-retry fallback for picky upstreams
-- Python 3.9+, standard library only
+- Python 3.9+, standard library only (`tiktoken` optional, for the token estimate)
 
 ## Quick start
 
@@ -47,8 +47,11 @@ python3 test_relay.py
 | `OPENCODE_GO_API_KEY` | *(empty)* | Optional. If set, all requests share this single key (server-key mode). If empty, every request must carry its own key (`Authorization: Bearer <key>` or `x-api-key: <key>`), which is forwarded upstream as-is. |
 | `RELAY_TOKEN` | *(empty)* | Optional client auth token for your own access control. **Set it (or restrict by IP) before exposing publicly** — without it anyone can use your relay. In per-request key mode, leave it empty so the client's own key is the credential. |
 | `DEFAULT_MODEL` | `deepseek-v4-flash` | Fallback model used when the client omits one; also advertised in `/v1/models`. Clients can request any OpenCode Go model (e.g. `glm-5.2`) and it is forwarded as-is. |
-| `UPSTREAM_BASE` | `https://opencode.ai/zen/go/v1` | Upstream OpenAI-compatible base URL. |
+| `UPSTREAM_BASE` | `https://opencode.ai/zen/go/v1` | Upstream base URL. In passthrough mode it must also serve the Anthropic-native `POST /messages` (the relay appends `/messages`). |
 | `HOST` / `PORT` | `0.0.0.0` / `8787` | Listen address. |
+| `ANTHROPIC_PASSTHROUGH` | `0` | `1` = forward `/v1/messages` to the upstream Anthropic-native endpoint instead of translating it to `chat/completions` (opt-in; see “Anthropic passthrough” below). |
+| `STREAM_CHUNK` | `8192` | Read size used when forwarding streamed bytes; the reader uses `read1`, so events are forwarded as they arrive instead of when the stream ends. |
+| `UPSTREAM_ERROR_BODY_LIMIT` | `1048576` | Max bytes of an upstream error body forwarded in passthrough mode. |
 | `STREAM_OPTIONS` | `1` | Send `stream_options.include_usage` upstream; set `0` if the upstream rejects it. |
 | `REQUEST_TIMEOUT` | `600` | Upstream request timeout (seconds). |
 | `UPSTREAM_UA` | *(browser UA)* | User-Agent sent upstream; some edges (e.g. Cloudflare) reject urllib's default. |
@@ -59,11 +62,41 @@ python3 test_relay.py
 
 | Path | Protocol | Translation |
 |---|---|---|
-| `POST /v1/messages` | Anthropic | → `chat/completions` |
+| `POST /v1/messages` | Anthropic | passthrough to upstream `/messages` when `ANTHROPIC_PASSTHROUGH=1`, else → `chat/completions` |
+| `POST /v1/messages/count_tokens` | Anthropic | local estimate (the upstream has no such endpoint) |
 | `POST /v1/responses` | Responses | → `chat/completions` |
 | `POST /v1/chat/completions` | OpenAI | passthrough (model rewritten) |
 | `GET /v1/models` | OpenAI | model list |
 | `GET /healthz` | — | health check (no auth) |
+
+### Anthropic passthrough (`ANTHROPIC_PASSTHROUGH=1`)
+
+OpenCode Go also exposes an **Anthropic-native** endpoint (`UPSTREAM_BASE + /messages`,
+authenticated with `x-api-key`; a Bearer token alone is rejected). It returns what Anthropic
+clients actually use — `cache_creation_input_tokens` / `cache_read_input_tokens` (prompt
+caching), thinking blocks, native `tool_use` including streaming `input_json_delta`, and
+`anthropic-beta` semantics — none of which survive a Messages ⇄ chat/completions translation.
+With the switch on, `/v1/messages`:
+
+- forwards the request body byte-for-byte (the only exception: a body without `model` gets
+  `DEFAULT_MODEL`, exactly like the translation path);
+- streams the response back verbatim, with no re-framing and no re-buffering;
+- keeps upstream error semantics: status code, `Content-Type` (including `text/html`),
+  `Retry-After` / request-id headers and the full body, up to `UPSTREAM_ERROR_BODY_LIMIT`;
+- sends a session id upstream (client's `x-opencode-session`, Claude Code's
+  `X-Claude-Code-Session-Id`, else a process-stable fallback). The upstream binds prompt-cache
+  affinity to that id, so a fresh id per request means a cold cache every time.
+
+Only models that speak the Anthropic protocol work in this mode — others answer
+`400 ModelProtocolUnsupported`; leave the switch at `0` for those.
+
+`POST /v1/messages/count_tokens` works in both modes. The upstream has no such endpoint (404),
+so the relay estimates locally: text (including `system`), `tool_result` / `tool_use` payloads
+and `tools` definitions are counted; thinking and image blocks are not. It uses `tiktoken`'s
+`o200k_base` when installed (`pip install tiktoken`, optional) and falls back to `len / 3.6`
+otherwise. Either way it is an **estimate** — the upstream tokenizer differs — so treat it as an
+order-of-magnitude hint rather than an authoritative count. Malformed bodies get `400`,
+estimation failures get `500`, and the relay never invents an `input_tokens` value.
 
 Auth: every request except `/healthz` must carry a key. In per-request key mode that key is the client's own OpenCode Go key (sent as `Authorization: Bearer <key>` or `x-api-key: <key>`) and is forwarded upstream. If `RELAY_TOKEN` is set, it acts as an additional gate: send it in one of the two headers and the upstream key in the other.
 
