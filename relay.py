@@ -65,6 +65,12 @@ MAX_BODY = 64 * 1024 * 1024  # 64 MB
 MAX_CONNECTIONS = _env_number("MAX_CONNECTIONS", 64)
 CLIENT_TIMEOUT = _env_number("CLIENT_TIMEOUT", 60)
 
+# Anthropic 原生透传：上游 OpenCode Zen 提供 Anthropic Messages 原生端点(/zen/go/v1/messages)，
+# 直接转发原始 body 并原样回传响应字节，prompt caching(cache_read_input_tokens /
+# cache_creation_input_tokens)、thinking 块、tool_use、SSE 事件序列、anthropic-beta 全部保持上游原生语义，
+# 不再经过“翻译成 OpenAI”的中间格式。设 ANTHROPIC_PASSTHROUGH=0 可退回旧的翻译模式。
+ANTHROPIC_PASSTHROUGH = os.environ.get("ANTHROPIC_PASSTHROUGH", "1") != "0"
+
 # Cloudflare 等上游会按请求签名拦截 urllib 默认的 Python UA，这里给一个浏览器 UA 兜底。
 UPSTREAM_UA = os.environ.get(
     "UPSTREAM_UA",
@@ -101,6 +107,83 @@ def upstream_request(path, payload, headers=None, api_key=None):
     for k, v in (headers or {}).items():
         req.add_header(k, v)
     return urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT)
+
+
+def upstream_anthropic_request(path, raw_body, headers=None, api_key=None):
+    """透传模式：把原始 Anthropic 请求打到上游的 Anthropic 原生端点(/messages)。
+
+    该端点只认 x-api-key；只送 Authorization: Bearer 会得到 401 AuthError("Missing API key")。
+    """
+    req = urllib.request.Request(UPSTREAM_BASE + path, data=raw_body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("x-api-key", (api_key or GO_KEY))
+    req.add_header("User-Agent", UPSTREAM_UA)
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    return urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT)
+
+
+_TIKTOKEN_ENC = None
+
+
+def _tiktoken_enc():
+    """惰性加载 tiktoken o200k_base；不可用返回 None(退字符估算)。"""
+    global _TIKTOKEN_ENC
+    if _TIKTOKEN_ENC is False:
+        return None
+    if _TIKTOKEN_ENC is None:
+        try:
+            import tiktoken
+            _TIKTOKEN_ENC = tiktoken.get_encoding("o200k_base")
+        except Exception:
+            _TIKTOKEN_ENC = False
+            return None
+    return _TIKTOKEN_ENC
+
+
+def estimate_input_tokens(payload):
+    """本地估算 Anthropic 请求的 input_tokens(上游没有 count_tokens 端点，实测 404)。
+
+    近似偏差来自分词器不同(上游模型的分词器 vs o200k_base)，所以这是估算值、不是权威计数；
+    Claude Code 用它做上下文预算/压缩判断，量级正确即可。
+    """
+    parts = []
+    sysblk = (payload or {}).get("system")
+    if isinstance(sysblk, str):
+        parts.append(sysblk)
+    elif isinstance(sysblk, list):
+        for b in sysblk:
+            if isinstance(b, dict) and b.get("text"):
+                parts.append(str(b["text"]))
+    for m in (payload or {}).get("messages") or []:
+        if not isinstance(m, dict):
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            parts.append(c)
+        elif isinstance(c, list):
+            for b in c:
+                if not isinstance(b, dict):
+                    continue
+                t = b.get("type")
+                if t == "text":
+                    parts.append(str(b.get("text", "")))
+                elif t == "tool_result":
+                    parts.append(json.dumps(b.get("content"), ensure_ascii=False))
+                elif t == "tool_use":
+                    parts.append(json.dumps(b.get("input"), ensure_ascii=False))
+                elif t == "image":
+                    parts.append("x" * 1600)  # 图像按固定量粗估
+    for t in (payload or {}).get("tools") or []:
+        parts.append(json.dumps(t, ensure_ascii=False))
+    blob = "\n".join(p for p in parts if p)
+    enc = _tiktoken_enc()
+    if enc is None:
+        return max(1, int(len(blob) / 3.6))
+    try:
+        return max(1, len(enc.encode(blob)))
+    except Exception:
+        return max(1, int(len(blob) / 3.6))
 
 
 def iter_sse_lines(resp):
@@ -1021,6 +1104,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": {"message": "invalid Content-Length"}})
             return None
         if length == 0:
+            self._raw_body = b"{}"
             return {}
         if length > MAX_BODY:
             self._send_json(413, {"error": {"message": "request body too large"}})
@@ -1031,6 +1115,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             self._send_json(408, {"error": {"message": "request body read timed out"}})
             return None
         try:
+            self._raw_body = raw
             return json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             self._send_json(400, {"error": {"message": "invalid JSON body"}})
@@ -1071,7 +1156,8 @@ class RelayHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = self.path.split("?")[0]
         if not self._check_auth():
-            self._send_json(401, {"error": {"message": "invalid relay token"}})
+            self._send_json(401, {"type": "error", "error": {
+                "type": "authentication_error", "message": "invalid relay token"}})
             return
         body = self._read_body()
         if body is None:
@@ -1083,7 +1169,12 @@ class RelayHandler(BaseHTTPRequestHandler):
             })
             return
         if path == "/v1/messages":
-            self._handle_anthropic(body, api_key)
+            if ANTHROPIC_PASSTHROUGH:
+                self._handle_anthropic_passthrough(getattr(self, "_raw_body", b""), api_key)
+            else:
+                self._handle_anthropic(body, api_key)
+        elif path == "/v1/messages/count_tokens":
+            self._handle_count_tokens(body)
         elif path == "/v1/responses":
             self._handle_responses(body, api_key)
         elif path == "/v1/chat/completions":
@@ -1094,7 +1185,8 @@ class RelayHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0]
         if path != "/healthz" and not self._check_auth():
-            self._send_json(401, {"error": {"message": "invalid relay token"}})
+            self._send_json(401, {"type": "error", "error": {
+                "type": "authentication_error", "message": "invalid relay token"}})
             return
         if path == "/healthz":
             self._send_json(200, {"ok": True})
@@ -1112,6 +1204,91 @@ class RelayHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": {"message": "not found"}})
 
     # -- Anthropic 端点 ----------------------------------------------------
+
+    def _handle_anthropic_passthrough(self, raw_body, api_key):
+        """薄透传：原始 Anthropic body → 上游 Anthropic 原生端点，响应字节原样回给客户端。
+
+        实测(2026-10)对比翻译模式：prompt caching 的 cache_read_input_tokens /
+        cache_creation_input_tokens 原生回传(相同长前缀第二次请求即命中)、thinking 块、
+        tool_use(含流式 input_json_delta)、SSE 事件序列、anthropic-beta 语义全部保持上游原生。
+        上游错误体同样是 Anthropic 形状，直接透传即可。
+        """
+        hdr = {}
+        for name in ("anthropic-version", "anthropic-beta"):
+            vals = self.headers.get_all(name) or []
+            if vals:
+                hdr[name] = ", ".join(vals)
+        hdr.setdefault("anthropic-version", "2023-06-01")
+        # 会话亲和：优先用 Claude Code 的会话 id，其次客户端给的 x-opencode-session，最后合成一个。
+        # (上游 Anthropic 端点并不强制该头；转发它是为了让同一会话稳定落到同一后端，从而命中 prompt cache。)
+        sid = (self.headers.get("X-Claude-Code-Session-Id", "") or "").strip() \
+            or (self.headers.get("x-opencode-session", "") or "").strip() or _uuid("ses_")
+        hdr["x-opencode-session"] = sid
+        is_stream = False
+        try:
+            is_stream = json.loads(raw_body.decode("utf-8")).get("stream") is True
+        except Exception:
+            pass
+        try:
+            upstream = upstream_anthropic_request("/messages", raw_body, headers=hdr, api_key=api_key)
+        except urllib.error.HTTPError as exc:
+            raw = b""
+            try:
+                raw = exc.read(65536)
+            except Exception:
+                pass
+            if not raw:
+                raw = json_bytes({"type": "error", "error": {
+                    "type": "api_error", "message": "upstream request failed"}})
+            self.send_response(exc.code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            try:
+                self.wfile.write(raw)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        except Exception as exc:
+            self._send_json(502, {"type": "error", "error": {
+                "type": "api_error", "message": "upstream unreachable: %s" % exc}})
+            return
+        try:
+            if is_stream:
+                self._start_sse()
+                while True:
+                    chunk = upstream.read(8192)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+            else:
+                data = upstream.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            try:
+                upstream.close()
+            except Exception:
+                pass
+
+    def _handle_count_tokens(self, body):
+        """上游没有 count_tokens 端点(实测 404)，这里本地估算。
+
+        用 tiktoken o200k_base 近似上游分词器：量级正确，但属于估算值、不是权威计数。
+        tiktoken 不可用时退化为字符数 / 3.6。
+        """
+        try:
+            n = estimate_input_tokens(body or {})
+        except Exception:
+            n = 1
+        self._send_json(200, {"input_tokens": n})
 
     def _handle_anthropic(self, body, api_key):
         requested_model = body.get("model") or DEFAULT_MODEL
@@ -1277,8 +1454,9 @@ def main():
 
     signal.signal(signal.SIGTERM, _shutdown)
     sys.stderr.write(
-        "OpenCode Go relay listening on http://%s:%d -> %s (model: %s)\n"
-        % (HOST, PORT, UPSTREAM_BASE, DEFAULT_MODEL))
+        "OpenCode Go relay listening on http://%s:%d -> %s (model: %s, /v1/messages: %s)\n"
+        % (HOST, PORT, UPSTREAM_BASE, DEFAULT_MODEL,
+           "anthropic-passthrough" if ANTHROPIC_PASSTHROUGH else "translate-to-openai"))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
