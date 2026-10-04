@@ -27,6 +27,9 @@ class MockUpstream(BaseHTTPRequestHandler):
     chat_requests = []
     session_headers = []
     last_auth = None
+    native_requests = []      # 打到原生 /messages 端点的请求(path/headers/raw/payload)
+    raw_bodies = []           # 所有上游收到的原始字节
+    NATIVE_HTML = b"<html><body>" + b"upstream error page " * 5000 + b"</body></html>"
 
     def log_message(self, *args):
         pass
@@ -38,9 +41,51 @@ class MockUpstream(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _native(self, payload, user_text, raw):
+        """Anthropic 原生端点(/messages):透传路径打到这里,回原生形状。"""
+        MockUpstream.native_requests.append({
+            "path": self.path,
+            "headers": {k.lower(): v for k, v in self.headers.items()},
+            "raw": raw,
+            "payload": payload,
+        })
+        if "TRIGGER_HTML_ERROR" in user_text:
+            self.send_response(500)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Retry-After", "7")
+            self.send_header("x-request-id", "rid-mock-1")
+            self.send_header("Content-Length", str(len(MockUpstream.NATIVE_HTML)))
+            self.end_headers()
+            self.wfile.write(MockUpstream.NATIVE_HTML)
+            return
+        if payload.get("stream"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            for index in range(3):
+                event = ('event: content_block_delta\ndata: {"i": %d}\n\n' % index).encode()
+                self.wfile.write(event)
+                self.wfile.flush()
+                time.sleep(0.6)
+            self.close_connection = True
+            return
+        body = {
+            "id": "msg_mock",
+            "type": "message",
+            "role": "assistant",
+            "model": payload.get("model"),
+            "content": [{"type": "text", "text": "native ok"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 12, "output_tokens": 3,
+                      "cache_creation_input_tokens": 0, "cache_read_input_tokens": 7},
+        }
+        self._send(200, "application/json", json.dumps(body).encode("utf-8"))
+
     def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b""
+        MockUpstream.raw_bodies.append(raw)
         payload = json.loads(raw.decode("utf-8"))
         MockUpstream.last_chat_request = payload
         MockUpstream.chat_requests.append(payload)
@@ -51,6 +96,10 @@ class MockUpstream(BaseHTTPRequestHandler):
             for m in payload.get("messages") or []
             if isinstance(m.get("content"), str)
         )
+
+        if self.path.rstrip("/").endswith("/messages"):
+            self._native(payload, user_text, raw)
+            return
 
         if "TRIGGER_HTML_ERROR" in user_text:
             self._send(502, "text/html", b"<html><body>cloudflare blocked</body></html>")
@@ -932,6 +981,132 @@ def test_chunked_rejected(base, port):
     print("PASS chunked Transfer-Encoding -> 400")
 
 
+def test_passthrough_default_is_translate(base):
+    """默认(未设 ANTHROPIC_PASSTHROUGH)必须仍走翻译路径 —— opt-in 的回归保护。"""
+    before = len(MockUpstream.native_requests)
+    status, body, _ = post(base + "/v1/messages",
+                           {"model": "m-translate", "max_tokens": 8,
+                            "messages": [{"role": "user", "content": "hello"}]})
+    assert status == 200
+    assert len(MockUpstream.native_requests) == before, "默认不该打原生端点"
+    assert MockUpstream.chat_requests[-1]["model"] == "m-translate"
+    print("PASS passthrough defaults to translate (opt-in)")
+
+
+def _native_payload():
+    return {
+        "model": "deepseek-v4.1-flash",
+        "max_tokens": 8,
+        "system": [{"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}],
+        "messages": [{"role": "user", "content": "hello"}],
+        "tools": [{"name": "t", "input_schema": {"type": "object"}}],
+    }
+
+
+def test_passthrough_nonstream(base):
+    payload = _native_payload()
+    status, body, ctype = post(base + "/v1/messages", payload)
+    assert status == 200
+    data = json.loads(body)
+    assert data["content"][0]["text"] == "native ok"
+    assert data["usage"]["cache_read_input_tokens"] == 7, "原生的缓存字段必须原样到达"
+    record = MockUpstream.native_requests[-1]
+    assert record["path"].rstrip("/").endswith("/messages")
+    assert json.loads(record["raw"].decode("utf-8")) == payload, "请求体必须字节保真"
+    assert record["headers"].get("x-api-key"), "透传必须带 x-api-key"
+    assert record["headers"].get("anthropic-version") == "2023-06-01"
+    print("PASS anthropic passthrough non-stream (byte fidelity + cache fields)")
+
+
+def test_passthrough_stream(base):
+    """流式:① SSE 字节保真 ② 事件在上游关流前就到(不是结束时一次性到达)。"""
+    payload = dict(_native_payload())
+    payload["stream"] = True
+    req = urllib.request.Request(base + "/v1/messages",
+                                 data=json.dumps(payload).encode("utf-8"), method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Authorization", "Bearer secret")
+    started = time.time()
+    first_event = None
+    seen = b""
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        while True:
+            line = resp.readline()
+            if not line:
+                break
+            seen += line
+            if line.strip().startswith(b"data:") and first_event is None:
+                first_event = time.time() - started
+    total = time.time() - started
+    assert b"event: content_block_delta" in seen, seen[:200]
+    assert seen.count(b"data:") == 3, seen
+    assert first_event is not None, "一个事件都没到"
+    assert first_event < total - 0.5, "事件被缓冲到流结束才到: first=%.2fs total=%.2fs" % (first_event, total)
+    print("PASS anthropic passthrough stream (byte fidelity + incremental delivery)")
+
+
+def test_passthrough_session_priority(base):
+    """会话 id 优先级:CC 会话头 → 客户端 x-opencode-session → 进程回退值。"""
+    payload = _native_payload()
+    post(base + "/v1/messages", payload,
+         headers={"X-Claude-Code-Session-Id": "cc-1", "x-opencode-session": "cli-1"})
+    assert MockUpstream.native_requests[-1]["headers"]["x-opencode-session"] == "cc-1"
+    post(base + "/v1/messages", payload, headers={"x-opencode-session": "cli-2"})
+    assert MockUpstream.native_requests[-1]["headers"]["x-opencode-session"] == "cli-2"
+    post(base + "/v1/messages", payload)
+    assert MockUpstream.native_requests[-1]["headers"]["x-opencode-session"] == "test-fallback-session"
+    print("PASS passthrough session priority (cc header > client header > fallback)")
+
+
+def test_passthrough_model_default(base):
+    """透传路径同样要补 DEFAULT_MODEL(与翻译路径语义一致),且仅此情况重序列化。"""
+    post(base + "/v1/messages", {"max_tokens": 8,
+                                 "messages": [{"role": "user", "content": "hello"}]})
+    forwarded = json.loads(MockUpstream.native_requests[-1]["raw"].decode("utf-8"))
+    assert forwarded["model"] == "deepseek-v4-flash", forwarded
+    print("PASS passthrough fills DEFAULT_MODEL when the request omits model")
+
+
+def test_passthrough_error(base):
+    """上游错误必须连同状态码、Content-Type、Retry-After/请求 id 与完整 body 透传。"""
+    payload = {"model": "m", "max_tokens": 8,
+               "messages": [{"role": "user", "content": "TRIGGER_HTML_ERROR"}]}
+    req = urllib.request.Request(base + "/v1/messages",
+                                 data=json.dumps(payload).encode("utf-8"), method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Authorization", "Bearer secret")
+    try:
+        urllib.request.urlopen(req, timeout=30)
+        assert False, "上游 500 不该被当成成功"
+    except urllib.error.HTTPError as exc:
+        raw = exc.read()
+        assert exc.code == 500, exc.code
+        assert exc.headers.get("Content-Type", "").startswith("text/html"), exc.headers.get("Content-Type")
+        assert exc.headers.get("Retry-After") == "7"
+        assert exc.headers.get("x-request-id") == "rid-mock-1"
+        assert len(raw) == len(MockUpstream.NATIVE_HTML), (len(raw), len(MockUpstream.NATIVE_HTML))
+    print("PASS passthrough upstream error (status + type + headers + full body)")
+
+
+def test_count_tokens(base):
+    status, body, _ = post(base + "/v1/messages/count_tokens",
+                           {"model": "m", "messages": [{"role": "user", "content": "x" * 4000}]})
+    assert status == 200
+    assert json.loads(body)["input_tokens"] > 500, "长文本不该被报成几乎空输入"
+    for bad in ({"model": "m"}, {"model": "m", "messages": "nope"}):
+        req = urllib.request.Request(base + "/v1/messages/count_tokens",
+                                     data=json.dumps(bad).encode("utf-8"), method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Authorization", "Bearer secret")
+        try:
+            urllib.request.urlopen(req, timeout=30)
+            assert False, "非法结构必须 400: %r" % (bad,)
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 400, exc.code
+            assert json.loads(exc.read())["error"]["type"] == "invalid_request_error"
+    print("PASS count_tokens (estimate for valid body, 400 for invalid structure)")
+
+
 def main():
     import tempfile
     mock, mock_port = start_mock()
@@ -951,6 +1126,23 @@ def main():
     relay_port = s.getsockname()[1]
     s.close()
     env["PORT"] = str(relay_port)
+
+    # 透传模式(opt-in):同一个 mock 上游,但走 Anthropic 原生 /messages 端点
+    env4 = dict(env)
+    env4["ANTHROPIC_PASSTHROUGH"] = "1"
+    sock4 = socket.socket()
+    sock4.bind(("127.0.0.1", 0))
+    passthrough_port = sock4.getsockname()[1]
+    sock4.close()
+    env4["PORT"] = str(passthrough_port)
+    err_log4 = tempfile.NamedTemporaryFile(delete=False, suffix=".log")
+    err_log4.close()
+    proc4 = subprocess.Popen(
+        [sys.executable, RELAY_PY],
+        env=env4,
+        stdout=subprocess.DEVNULL,
+        stderr=open(err_log4.name, "wb"),
+    )
     err_log = tempfile.NamedTemporaryFile(delete=False, suffix=".log")
     err_log.close()
     proc = subprocess.Popen(
@@ -1025,6 +1217,20 @@ def main():
         test_html_sse_guard(base)
         test_thinking_blocks(base)
 
+        test_passthrough_default_is_translate(base)
+
+        base4 = "http://127.0.0.1:%d" % passthrough_port
+        if not wait_ready(passthrough_port):
+            with open(err_log4.name, "rb") as f:
+                sys.stderr.write("RELAY4 STDERR:\n" + f.read().decode("utf-8", "replace") + "\n")
+            assert False, "passthrough relay did not start"
+        test_passthrough_nonstream(base4)
+        test_passthrough_stream(base4)
+        test_passthrough_session_priority(base4)
+        test_passthrough_model_default(base4)
+        test_passthrough_error(base4)
+        test_count_tokens(base4)
+
         base2 = "http://127.0.0.1:%d" % relay_port2
         if not wait_ready(relay_port2):
             with open(err_log2.name, "rb") as f:
@@ -1051,6 +1257,8 @@ def main():
             proc2.wait(timeout=5)
         proc3.terminate()
         proc3.wait(timeout=5)
+        proc4.terminate()
+        proc4.wait(timeout=5)
         mock.shutdown()
         mock.server_close()
 

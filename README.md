@@ -1,22 +1,29 @@
 # OpenCode Go Relay
 
-A zero-dependency protocol bridge that lets **Claude Code** (Anthropic Messages) and **Codex** (OpenAI Responses) share the OpenAI-compatible models in your [OpenCode Go](https://opencode.ai) subscription — default model `deepseek-v4-flash`. Pure Python standard library, single file, no third-party deps.
+A protocol bridge that lets **Claude Code** (Anthropic Messages) and **Codex** (OpenAI Responses) share the models in your [OpenCode Go](https://opencode.ai) subscription — default model `deepseek-v4-flash`. Pure Python standard library, single file; the only optional third-party dependency is `tiktoken`, used to improve the local `/v1/messages/count_tokens` estimate.
 
-> 中文简介:一个零依赖的协议中转站,让 Claude Code(Anthropic Messages 协议)和 Codex(OpenAI Responses 协议)共用 OpenCode Go 订阅里的 OpenAI 兼容模型。纯 Python 标准库,单文件,无第三方依赖。
+> 中文简介:一个协议中转站,让 Claude Code(Anthropic Messages 协议)和 Codex(OpenAI Responses 协议)共用 OpenCode Go 订阅里的模型。纯 Python 标准库,单文件;唯一可选的第三方依赖是 `tiktoken`(用于改进本地 `/v1/messages/count_tokens` 估算)。
 
 ## Why?
 
-OpenCode Go exposes an OpenAI-compatible endpoint (`https://opencode.ai/zen/go/v1`), but the models behind it (e.g. DeepSeek V4 Flash) only speak `chat/completions`:
+OpenCode Go exposes both an OpenAI-compatible endpoint (`https://opencode.ai/zen/go/v1/chat/completions`) and an **Anthropic-native endpoint** (`https://opencode.ai/zen/go/v1/messages`, authenticated with `x-api-key`). The two are not equivalent:
 
-- **Claude Code** only speaks the Anthropic Messages protocol → needs a bridge to translate Messages ⇄ chat/completions (including streaming SSE and tool calls).
-- **Codex** can point directly at the upstream with `wire_api = "chat"` (no relay needed), but routing it through the relay gives you a single auth token, a single model alias, and one place to deploy.
+- The native endpoint returns what Anthropic clients actually need — `cache_creation_input_tokens` / `cache_read_input_tokens` (prompt caching), thinking blocks, native `tool_use` (including streaming `input_json_delta`) and `anthropic-beta` semantics. Translating Messages ⇄ chat/completions necessarily drops that information.
+- Only some models support the native protocol; others (e.g. `longcat-2.5-preview-free`) answer `400 ModelProtocolUnsupported` there and must go through `chat/completions`.
+
+So the relay supports both: an opt-in **Anthropic passthrough** (`ANTHROPIC_PASSTHROUGH=1`) that forwards `/v1/messages` to the native endpoint byte-for-byte, and the original translation path as the default.
+
 
 ## Features
 
-- **`POST /v1/messages`** (Anthropic) ⇄ upstream `chat/completions`
-  - system blocks, tool use / tool results, images (URL + base64), thinking blocks
-  - `tool_choice` mapping (`any` → `required`, named tool, etc.)
-  - full SSE streaming translation: `message_start`, `content_block_delta`, `input_json_delta`, `message_delta`, `message_stop`
+- **`POST /v1/messages`** — two modes:
+  - *passthrough* (`ANTHROPIC_PASSTHROUGH=1`, opt-in): bytes forwarded to the upstream Anthropic-native endpoint, response bytes streamed back verbatim — prompt-cache fields, thinking, tool_use and `anthropic-beta` stay native; upstream errors keep their status, `Content-Type` and `Retry-After`/request-id headers
+  - *translation* (default) (Anthropic) ⇄ upstream `chat/completions`
+    - system blocks, tool use / tool results, images (URL + base64), thinking blocks
+    - `tool_choice` mapping (`any` → `required`, named tool, etc.)
+    - full SSE streaming translation: `message_start`, `content_block_delta`, `input_json_delta`, `message_delta`, `message_stop`
+- **`POST /v1/messages/count_tokens`** — the upstream has no such endpoint (404), so the relay estimates locally (see below)
+
 - **`POST /v1/responses`** (Responses) ⇄ upstream `chat/completions`
   - `instructions` → system, `function_call` / `function_call_output` items, `max_output_tokens` → `max_tokens`
   - SSE translation: `response.created`, `output_text.delta`, `function_call_arguments.delta`, `response.completed`
@@ -48,9 +55,13 @@ python3 test_relay.py
 | `RELAY_TOKEN` | *(empty)* | Optional client auth token for your own access control. **Set it (or restrict by IP) before exposing publicly** — without it anyone can use your relay. In per-request key mode, leave it empty so the client's own key is the credential. |
 | `DEFAULT_MODEL` | `deepseek-v4-flash` | Fallback model used when the client omits one; also advertised in `/v1/models`. Clients can request any OpenCode Go model (e.g. `glm-5.2`) and it is forwarded as-is. |
 | `MODELS_EXTRA` | *(empty)* | Comma-separated extra model IDs advertised in `/v1/models` alongside `DEFAULT_MODEL` (e.g. `deepseek-v4-pro,glm-5.2`). Useful when clients discover models from `/v1/models` (e.g. Claude Code with `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`). Does not restrict what clients can request — any model is still forwarded as-is. |
-| `UPSTREAM_BASE` | `https://opencode.ai/zen/go/v1` | Upstream OpenAI-compatible base URL. |
+| `UPSTREAM_BASE` | `https://opencode.ai/zen/go/v1` | Upstream base URL. In passthrough mode it must also serve the Anthropic-native `POST /messages` (it appends `/messages`). |
 | `HOST` / `PORT` | `0.0.0.0` / `8787` | Listen address. |
-| `STREAM_OPTIONS` | `1` | Send `stream_options.include_usage` upstream; set `0` if the upstream rejects it. |
+| `ANTHROPIC_PASSTHROUGH` | `0` | `1` = forward `/v1/messages` to the upstream Anthropic-native endpoint instead of translating it to `chat/completions` (opt-in; see the passthrough section below for what it changes). |
+| `RELAY_SESSION_ID` | *(random per process)* | Value sent upstream as `x-opencode-session` when the client sends none. The upstream binds prompt-cache affinity to this id, so a stable value lets repeat requests hit the cache. |
+| `STREAM_CHUNK` | `8192` | Read size used when forwarding streamed bytes. Kept as a knob only because the reader switches to `read1`, which returns as soon as data arrives. |
+| `UPSTREAM_ERROR_BODY_LIMIT` | `1048576` | Max bytes of an upstream error body forwarded in passthrough mode (larger bodies are truncated). |
+| `STREAM_OPTIONS` | `1` | Send `stream_options.include_usage` upstream in the translation path; set `0` if the upstream rejects it. Ignored by passthrough (the body is forwarded untouched). |
 | `REQUEST_TIMEOUT` | `600` | Upstream request timeout (seconds). |
 | `UPSTREAM_UA` | *(browser UA)* | User-Agent sent upstream; some edges (e.g. Cloudflare) reject urllib's default. |
 | `MAX_CONNECTIONS` | `64` | Max concurrent connections; excess connections wait (backpressure). |
@@ -60,11 +71,25 @@ python3 test_relay.py
 
 | Path | Protocol | Translation |
 |---|---|---|
-| `POST /v1/messages` | Anthropic | → `chat/completions` |
+| `POST /v1/messages` | Anthropic | passthrough to upstream `/messages` when `ANTHROPIC_PASSTHROUGH=1`, else → `chat/completions` |
+| `POST /v1/messages/count_tokens` | Anthropic | local estimate (upstream has no such endpoint) |
 | `POST /v1/responses` | Responses | → `chat/completions` |
 | `POST /v1/chat/completions` | OpenAI | passthrough (model rewritten) |
 | `GET /v1/models` | OpenAI | model list |
 | `GET /healthz` | — | health check (no auth) |
+
+### Anthropic passthrough (`ANTHROPIC_PASSTHROUGH=1`)
+
+What changes on `/v1/messages`:
+
+- the request body is forwarded byte-for-byte to `UPSTREAM_BASE + /messages` and authenticated with `x-api-key` (the native endpoint rejects `Authorization: Bearer` alone). The one exception: if the body has no `model`, `DEFAULT_MODEL` is filled in, exactly like the translation path.
+- the response is streamed back verbatim (no re-framing, no re-typing), so `cache_creation_input_tokens` / `cache_read_input_tokens`, thinking blocks, native `tool_use` and `anthropic-beta` behaviour are the upstream's, not the relay's.
+- an upstream error is forwarded with its status code, its `Content-Type` (including `text/html`), `Retry-After` / request-id headers and full body (up to `UPSTREAM_ERROR_BODY_LIMIT`).
+- a request without a client session id gets `RELAY_SESSION_ID`; Claude Code's `X-Claude-Code-Session-Id` (or the client's `x-opencode-session`) takes priority.
+- only models that support the Anthropic protocol work here — others answer `400 ModelProtocolUnsupported`. Leave the switch at `0` for those.
+
+`/v1/messages/count_tokens` is **not** controlled by this switch and is available either way. The upstream has no such endpoint (404), so the relay counts locally: text (including `system`), `tool_result` / `tool_use` payloads and `tools` definitions count; thinking and image blocks do not. Counting uses `tiktoken`'s `o200k_base` when installed (`pip install tiktoken`) and falls back to `len / 3.6` otherwise. Either way it is an **estimate** — the upstream tokenizer differs, so treat the number as an order-of-magnitude hint, not an authoritative count. Invalid request bodies get `400`, and estimation failures get `500` — never a fake `input_tokens`.
+
 
 Auth: every request except `/healthz` must carry a key. In per-request key mode that key is the client's own OpenCode Go key (sent as `Authorization: Bearer <key>` or `x-api-key: <key>`) and is forwarded upstream. If `RELAY_TOKEN` is set, it acts as an additional gate: send it in one of the two headers and the upstream key in the other.
 
@@ -112,6 +137,10 @@ Or in `~/.claude/settings.json`:
 
 > 中文:Claude Code 通过环境变量指向 relay(`ANTHROPIC_BASE_URL`),relay 把 Messages 协议翻译成上游 chat/completions。
 
+With `ANTHROPIC_PASSTHROUGH=1` (see above) the relay forwards Messages to the upstream native endpoint instead. That is what makes prompt caching visible to Claude Code: `cacheReadInputTokens` only appears when the same session id is reused, which is why the relay forwards Claude Code's own session id (or `RELAY_SESSION_ID`). Two caveats worth knowing: Claude Code's `cost` figure is its own price-table estimate for a model it doesn't know — it is not the upstream's billing — and only models that speak the Anthropic protocol work in passthrough mode.
+
+> 中文:设 `ANTHROPIC_PASSTHROUGH=1` 时 relay 把 Messages 原样转给上游原生端点,Claude Code 才能看到 prompt caching 的 `cacheReadInputTokens`(同一会话 id 复用才会命中,所以 relay 转发 Claude Code 自己的会话 id,或退回 `RELAY_SESSION_ID`)。两点注意:Claude Code 显示的 `cost` 是它按内置价位估的,不等于上游账单;透传模式下只有支持 Anthropic 协议的模型可用。
+
 ### Codex
 
 Either point Codex straight at the upstream (OpenAI `chat` wire — no relay needed):
@@ -157,7 +186,7 @@ group and ICP-filing notes — see [`docs/aliyun-deploy.md`](docs/aliyun-deploy.
 
 ## Tests
 
-`test_relay.py` spins up a mock upstream and validates all six paths (auth, models, Anthropic non-stream/stream, Responses non-stream/stream, chat passthrough) with no network access:
+`test_relay.py` spins up a mock upstream and validates every path (auth, models, Anthropic non-stream/stream in both translation and passthrough modes, Responses non-stream/stream, chat passthrough, `count_tokens`, session-id priority, error passthrough) with no network access:
 
 ```bash
 python3 test_relay.py
