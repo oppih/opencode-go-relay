@@ -185,6 +185,41 @@ ANTHROPIC_MODEL="deepseek-v4-flash" \
 claude
 ```
 
+## Anthropic 原生透传（可选，推荐给 Claude Code）
+
+relay 的 `/v1/messages` 有两种模式:
+
+- **翻译模式（默认）**:把 Anthropic Messages 翻译成上游 `chat/completions`。
+- **透传模式（`ANTHROPIC_PASSTHROUGH=1`）**:原始 body 直接打到上游 Anthropic 原生端点
+  `<UPSTREAM_BASE>/messages`，响应字节原样回传。好处是 `cache_read_input_tokens` /
+  `cache_creation_input_tokens`（prompt caching，Claude Code 的 `/cost`、上下文预算都看它）、
+  thinking 块、原生 `tool_use`（含流式 `input_json_delta`）不会被翻译层丢掉。
+
+在本部署里加一行即可（key 仍然按请求从客户端取，relay 会把它放进上游要求的 `x-api-key`）:
+
+```bash
+# /etc/opencode-go-relay.env （或你的启动脚本，注意必须写在 exec 之前）
+ANTHROPIC_PASSTHROUGH=1
+RELAY_SESSION_ID=relay-aliyun-1     # 可选:客户端不带会话头时的稳定回退值(prompt cache 亲和)
+```
+
+注意:
+
+- 该端点只认 `x-api-key`(送 `Authorization: Bearer` 会回 `401 Missing API key`),relay 已处理。
+- 只有讲 Anthropic 协议的模型能用;其它模型回 `400 ModelProtocolUnsupported`,此时把它改回 `0`。
+- 缓存的粒度绑在**会话 id**上:同一会话(Claude Code `--continue`)才会命中,新会话必然冷缓存。
+- `/v1/messages/count_tokens` 是本机估算(上游 404),数据量大时用于上下文预算,不是权威计数。
+- 判活不要只看 `/healthz`:看启动日志里的 `/v1/messages: anthropic-passthrough`(或 `translate-to-openai`)。
+  nginx 侧 `proxy_buffering off;` 必须保留,否则 SSE 会被 nginx 攒批。
+- 逐块验证(每个事件的时间戳应该错开,而不是全在同一时刻):
+
+```bash
+curl -N -s https://<YOUR_DOMAIN>:8558/opencode-go/anthropic/v1/messages \
+  -H "Authorization: Bearer <OPENCODE_GO_KEY>" -H 'content-type: application/json' \
+  -d '{"model":"deepseek-v4-flash","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"Count to twenty."}]}' \
+  | while IFS= read -r l; do printf '%s %s\n' "$(date +%s.%N)" "$l"; done
+```
+
 ## 运维
 
 - 启停：`~/opencode-go-relay/run.sh {start|stop|restart}`
