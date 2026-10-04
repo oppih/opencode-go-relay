@@ -5,7 +5,7 @@
 #   sudo systemctl enable --now opencode-go-relay
 
 [Unit]
-Description=OpenCode Go protocol relay (Anthropic/Responses -> chat/completions)
+Description=OpenCode Go protocol relay (Anthropic/Responses -> chat/completions, optional Anthropic passthrough)
 After=network-online.target
 Wants=network-online.target
 
@@ -14,7 +14,8 @@ Type=simple
 User=relay
 Group=relay
 ExecStart=/usr/bin/python3 /opt/opencode-go-relay/relay.py
-# Keys live in a root-only file, not in the unit itself
+# Keys and relay behaviour live in a root-only file, not in the unit itself.
+# See examples/.env.example for the full list (ANTHROPIC_PASSTHROUGH, ...).
 EnvironmentFile=/etc/opencode-go-relay.env
 Restart=on-failure
 RestartSec=3

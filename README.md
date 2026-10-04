@@ -4,6 +4,24 @@ A protocol bridge that lets **Claude Code** (Anthropic Messages) and **Codex** (
 
 > 中文简介:一个协议中转站,让 Claude Code(Anthropic Messages 协议)和 Codex(OpenAI Responses 协议)共用 OpenCode Go 订阅里的 OpenAI 兼容模型。纯 Python 标准库,单文件(可选依赖 tiktoken 仅用于改进 token 估算)。
 
+## What this branch adds
+
+Single-topic patch against upstream `main`. Only `/v1/messages` changes behaviour, and only when
+you ask for it.
+
+| Area | Change | Default |
+|---|---|---|
+| `/v1/messages` | opt-in Anthropic passthrough: byte-faithful forwarding to the upstream native endpoint, response streamed back verbatim, so prompt caching / thinking / native `tool_use` survive | `ANTHROPIC_PASSTHROUGH=0` (translation path unchanged) |
+| `/v1/messages/count_tokens` | local estimate (the upstream returns 404); `tiktoken`-based with a character fallback | available in both modes |
+| Streaming | bytes are forwarded as they arrive (`read1`), instead of all at once when the upstream closes | — |
+| Errors | upstream status, `Content-Type`, `Retry-After` / request-id headers and full body are forwarded in passthrough mode; relay-level 401s use the Anthropic envelope | — |
+| Tests & docs | `test_passthrough.py`, `tools/contract_check.py`, README sections, examples | — |
+
+`/v1/chat/completions`, `/v1/responses`, `/v1/models` and `/healthz` are untouched.
+
+The fork's `main` branch additionally carries `MODELS_EXTRA` (PR #1) and a process-stable session
+fallback, `RELAY_SESSION_ID` (PR #2). Both are separate changes and deliberately absent here.
+
 ## Why?
 
 OpenCode Go exposes an OpenAI-compatible endpoint (`https://opencode.ai/zen/go/v1`), but the models behind it (e.g. DeepSeek V4 Flash) only speak `chat/completions`:
@@ -122,6 +140,10 @@ provider config and point `base_url` at the relay.
 
 ## Client setup
 
+Client config samples live in [`examples/`](examples/README.md), which also explains the two
+things that trip people up: Claude Code settings must be strict JSON, and the relay's mode decides
+whether the client ever sees a non-zero cache read.
+
 ### Claude Code (via the relay)
 
 ```bash
@@ -173,6 +195,46 @@ env_key = "RELAY_TOKEN"
 wire_api = "chat"
 ```
 
+### Verifying a deployment
+
+`/healthz` and `systemctl status` only prove the process is up — not that the auth chain and the
+upstream work, and not which mode `/v1/messages` is in. Two cheap checks:
+
+1. the startup banner names the mode: `... /v1/messages: anthropic-passthrough` or
+   `... /v1/messages: translate-to-openai` (that is `ANTHROPIC_PASSTHROUGH` as the process sees
+   it — if it disagrees with your config, your `export` is in the wrong place, see below);
+2. `tools/contract_check.py` exercises every endpoint against the live relay and prints
+   PASS / GAP / FAIL per check. It costs tokens (it talks to the real upstream), so run it after
+   a config change rather than on a timer:
+
+```bash
+export RELAY_BASE=http://127.0.0.1:8787
+export RELAY_TOKEN=<your RELAY_TOKEN>
+python3 tools/contract_check.py     # exit 0 = no FAIL
+```
+
+### Wrapping the relay in a shell script
+
+If you launch the relay from a script, environment variables must be exported **before** the
+`exec` line — anything appended after `exec python3 relay.py` never runs, and the relay silently
+keeps its default mode. That failure is invisible in `systemctl status` and `/healthz`; the
+startup banner or the contract check is what catches it.
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| Claude Code streams nothing until the answer is complete | You are running a build older than the `read1` fix, or a proxy in front of the relay buffers. Check with a raw client — if every event arrives at the same timestamp, something is buffering: `curl -N -s $RELAY_BASE/v1/messages -H "Authorization: Bearer $RELAY_TOKEN" -H 'content-type: application/json' -d '{"model":"deepseek-v4-flash","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"Count to twenty."}]}' \| while IFS= read -r l; do printf '%s %s\n' "$(date +%s.%N)" "$l"; done` |
+| `cacheReadInputTokens` is always 0 | Prompt caching follows the session id, and this branch forwards the client's own session id (`X-Claude-Code-Session-Id` / `x-opencode-session`). A client that sends neither gets a fresh id per request, which is a cold cache every time; a continued Claude Code session reuses its id and does hit. |
+| Claude Code shows a cost far above your subscription | Its `cost` field is a local price-table estimate for a model it doesn't know — not the upstream's billing. |
+| `400 MissingSessionID` on the upstream | The OpenAI-format path (`chat/completions`) expects `x-opencode-session`. The passthrough path always sends one; on the translation path the relay forwards whatever the client sent, so a client that never sets it can hit this. |
+| `403 FreeTierError` for free models on the direct `/zen/v1` path | Those models are gated by client identity; only the official CLI gets them. Not something the relay can (or should) work around. |
+| `400 ModelProtocolUnsupported` in passthrough mode | That model only speaks `chat/completions`; set `ANTHROPIC_PASSTHROUGH=0` for it. |
+| Requests fail with Cloudflare `error code: 1010` | The upstream rejects urllib's default User-Agent. Keep `UPSTREAM_UA` at its default (a browser UA). |
+| `/v1/messages/count_tokens` returns numbers that look off | It is an estimate, not the upstream tokenizer. Install `tiktoken` to improve it; the number is for context budgeting only. |
+| An error body doesn't look like Anthropic's | Relay-level 401s use the Anthropic envelope; anything that comes from the upstream is forwarded with its own status, `Content-Type` and body, so a non-Anthropic upstream error stays non-Anthropic. |
+| A stream dies mid-answer with no error | The upstream stalled after sending headers: the relay closes the connection explicitly instead of hanging (check `journalctl`/stderr for the message). |
+
 ## Deployment (systemd)
 
 See [`examples/opencode-go-relay.service`](examples/opencode-go-relay.service) for a ready-to-adapt unit file. Use `EnvironmentFile=` to keep keys out of the unit itself.
@@ -189,11 +251,34 @@ group and ICP-filing notes — see [`docs/aliyun-deploy.md`](docs/aliyun-deploy.
 
 ## Tests
 
-`test_relay.py` spins up a mock upstream and validates all six paths (auth, models, Anthropic non-stream/stream, Responses non-stream/stream, chat passthrough) with no network access:
+`test_relay.py` starts a mock upstream and validates every path (auth, models, Anthropic
+non-stream/stream in both translation and passthrough modes, Responses non-stream/stream, chat
+passthrough, `count_tokens`, session-id priority, error passthrough) with no network access:
 
 ```bash
 python3 test_relay.py
 ```
+
+`test_passthrough.py` covers the new mode on its own (mock native upstream, both switch positions,
+byte fidelity, incremental delivery, session priority, model default, error passthrough):
+
+```bash
+python3 test_passthrough.py
+```
+
+`tools/contract_check.py` is the complementary live check: it runs the same surface against a
+running relay and its real upstream and prints PASS / GAP / FAIL per check (see
+[Verifying a deployment](#verifying-a-deployment)). It costs tokens, so it is meant to be run
+after a change, not on a schedule.
+
+```bash
+RELAY_BASE=http://127.0.0.1:8787 RELAY_TOKEN=<token> python3 tools/contract_check.py
+```
+
+The `read1` streaming fix was originally found with a raw-socket timing harness (mock upstream
+emitting an event every 0.8 s): through a buffering relay all events arrive at the moment the
+upstream closes, with `read1` they arrive at 0.0 / 0.8 / 1.6 / 2.4 s. If you touch the forwarding
+loop, re-measure arrival times rather than trusting the payload.
 
 ## License
 
